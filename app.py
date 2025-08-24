@@ -188,44 +188,80 @@ def trend_ok(price: float) -> Tuple[bool, float]:
         return True, float("nan")
     
 def advisor_fetch_effective(symbol: str):
-    """Haal effectieve advisor-instellingen op; probeer eerst POST, dan GET."""
+    """Haal effectieve advisor-instellingen op (probeer POST _action=get, POST plain, dan GET)."""
     if not (ADVISOR_ENABLED and ADVISOR_URL):
         return None
+
+    # Bouw headers – sommige Advisors accepteren 'Authorization', anderen 'X-Advisor-Secret'
     headers = {"Content-Type": "application/json"}
     if ADVISOR_SECRET:
         headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
+        headers["X-Advisor-Secret"] = ADVISOR_SECRET  # extra compat
+
+    def try_json(resp):
+        try:
+            return resp.json()
+        except Exception:
+            return {"ok": False, "status": resp.status_code, "error": resp.text[:200]}
+
     try:
-        # 1) POST (meest gebruikelijk bij jouw Advisor)
-        r = requests.post(ADVISOR_URL, json={"symbol": symbol}, headers=headers, timeout=2.5)
-        if r.ok:
-            try:
-                return r.json()
-            except Exception:
-                return {"ok": False, "error": "invalid_json_post"}
+        # 1) POST met _action=get
+        try:
+            r = requests.post(
+                ADVISOR_URL,
+                json={"symbol": symbol, "_action": "get"},
+                headers=headers,
+                timeout=2.5,
+            )
+            if r.ok:
+                return try_json(r)
+            # Laat debug-info zien als unauthorized of andere fout
+            if r.status_code == 401:
+                print(f"[ADVISOR] POST _action=get -> 401 Unauthorized")
+            else:
+                print(f"[ADVISOR] POST _action=get -> {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"[ADVISOR] fetch POST _action=get fail: {e}")
 
-        # 2) Fallback: GET ?symbol=...
-        r2 = requests.get(ADVISOR_URL, params={"symbol": symbol}, headers=headers, timeout=2.5)
-        if r2.ok:
-            try:
-                return r2.json()
-            except Exception:
-                return {"ok": False, "error": "invalid_json_get"}
+        # 2) POST zonder _action
+        try:
+            r2 = requests.post(
+                ADVISOR_URL,
+                json={"symbol": symbol},
+                headers=headers,
+                timeout=2.5,
+            )
+            if r2.ok:
+                return try_json(r2)
+            if r2.status_code == 401:
+                print(f"[ADVISOR] POST symbol -> 401 Unauthorized")
+            else:
+                print(f"[ADVISOR] POST symbol -> {r2.status_code}: {r2.text[:200]}")
+        except Exception as e:
+            print(f"[ADVISOR] fetch POST symbol fail: {e}")
 
-        return {"ok": False, "status": r.status_code, "error": r.text[:200]}
+        # 3) GET ?symbol=...
+        try:
+            r3 = requests.get(
+                ADVISOR_URL,
+                params={"symbol": symbol},
+                headers=headers,
+                timeout=2.5,
+            )
+            if r3.ok:
+                return try_json(r3)
+            if r3.status_code == 401:
+                print(f"[ADVISOR] GET symbol -> 401 Unauthorized")
+            else:
+                print(f"[ADVISOR] GET symbol -> {r3.status_code}: {r3.text[:200]}")
+        except Exception as e:
+            print(f"[ADVISOR] fetch GET fail: {e}")
+
+        # Geen succes
+        return {"ok": False, "error": "no_successful_variant"}
     except Exception as e:
-        print(f"[ADVISOR] fetch_effective fail: {e}")
+        print(f"[ADVISOR] fetch_effective unexpected fail: {e}")
         return {"ok": False, "error": str(e)[:200]}
-    
-def blocked_by_cooldown() -> bool:
-    return (time.time() - last_action_ts) < MIN_TRADE_COOLDOWN_S if MIN_TRADE_COOLDOWN_S > 0 else False
-
-def is_duplicate_signal(action: str, source: str, price: float, tf: str) -> bool:
-    key = (action, source, round(price, 4), tf)
-    ts = last_signal_key_ts.get(key, 0.0)
-    if (time.time() - ts) <= DEDUP_WINDOW_S:
-        return True
-    last_signal_key_ts[key] = time.time()
-    return False
 
 # --- Flask ---
 app = Flask(__name__)
