@@ -80,6 +80,8 @@ def send_tg(text_html: str):
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
+from typing import Tuple  # staat al bij jou
+
 def advisor_allows(action: str, price: float, source: str, tf: str) -> Tuple[bool, str]:
     """
     Toestemming via Multi-Bot Advisor met lokale overrides/fail-modes.
@@ -114,6 +116,8 @@ def advisor_allows(action: str, price: float, source: str, tf: str) -> Tuple[boo
             headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
         try:
             r = requests.post(ADVISOR_URL, json=payload, headers=headers, timeout=2.5)
+            if r.status_code >= 400:
+                print(f"[ADVISOR] HTTP {r.status_code} -> {r.text[:300]}")
             try:
                 j = r.json()
             except Exception:
@@ -123,13 +127,11 @@ def advisor_allows(action: str, price: float, source: str, tf: str) -> Tuple[boo
             return allow, reason
         except Exception as e:
             print(f"[ADVISOR] unreachable: {e}")
-            # val door naar fail-mode
 
     # 4) Fail-mode
     if ADVISOR_FAIL_MODE == "closed":
         return False, "fail_closed"
     return True, "fail_open"
-
 
 # --- Persistente log helpers ---
 def load_trades():
@@ -172,7 +174,7 @@ def log_trade(action: str, price: float, winst: float, source: str, tf: str):
         trade_log[:] = trade_log[-2000:]
     save_trades()
 
-def trend_ok(price: float) -> tuple[bool, float]:  # of -> Tuple[bool, float] + import
+def trend_ok(price: float) -> Tuple[bool, float]:
     """MA200: koop alleen boven MA200 (1m). Bij fout niet blokkeren."""
     if not USE_TREND_FILTER or exchange is None:
         return True, float("nan")
@@ -407,24 +409,27 @@ def advisor_status():
 
 @app.route("/advisor/set", methods=["POST"])
 def advisor_set():
-    global ADVISOR_FAIL_MODE, ADVISOR_MANUAL_OVERRIDE, ADVISOR_ALLOW_SOURCES, ADVISOR_BLOCK_SOURCES
+    global ADVISOR_FAIL_MODE, ADVISOR_MANUAL_OVERRIDE
+    global ADVISOR_ALLOW_SOURCES, ADVISOR_BLOCK_SOURCES
+    global ADVISOR_ENABLED, ADVISOR_URL, ADVISOR_SECRET
+
     data = request.get_json(force=True, silent=True) or {}
 
     # Basis toggle/config
     if "enabled" in data:
-        globals()["ADVISOR_ENABLED"] = bool(data["enabled"])
+        ADVISOR_ENABLED = bool(data["enabled"])
     if "url" in data:
-        globals()["ADVISOR_URL"] = str(data["url"]).strip()
+        ADVISOR_URL = str(data["url"]).strip()
     if "secret" in data:
-        globals()["ADVISOR_SECRET"] = str(data["secret"]).strip()
+        ADVISOR_SECRET = str(data["secret"]).strip()
     if data.get("fail_mode") in ("open", "closed"):
         ADVISOR_FAIL_MODE = data["fail_mode"]
 
     # Allow/Block lijsten
     if "allow_sources" in data:
-        ADVISOR_ALLOW_SOURCES = set([str(s).lower() for s in (data.get("allow_sources") or [])])
+        ADVISOR_ALLOW_SOURCES = set(str(s).lower() for s in (data.get("allow_sources") or []))
     if "block_sources" in data:
-        ADVISOR_BLOCK_SOURCES = set([str(s).lower() for s in (data.get("block_sources") or [])])
+        ADVISOR_BLOCK_SOURCES = set(str(s).lower() for s in (data.get("block_sources") or []))
 
     # Tijdelijke manual override: {"override":{"mode":"allow"|"block","seconds":600,"reason":"..."}}
     if isinstance(data.get("override"), dict):
