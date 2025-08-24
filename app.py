@@ -184,6 +184,41 @@ def trend_ok(price: float) -> tuple[bool, float]:  # of -> Tuple[bool, float] + 
     except Exception as e:
         print(f"[TREND] fetch fail: {e}")
         return True, float("nan")
+    
+def advisor_fetch_effective(symbol: str):
+    """Haal effectieve advisor-instellingen op (probeert GET en zo nodig POST fallback)."""
+    if not (ADVISOR_ENABLED and ADVISOR_URL):
+        return None
+    headers = {"Content-Type": "application/json"}
+    if ADVISOR_SECRET:
+        headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
+    try:
+        # 1) Probeer GET ?symbol=...
+        try:
+            r = requests.get(ADVISOR_URL, params={"symbol": symbol}, headers=headers, timeout=2.5)
+            if r.ok:
+                j = r.json()
+                if isinstance(j, dict):
+                    return j
+        except Exception:
+            pass
+        # 2) Fallback: POST naar hetzelfde endpoint met _action=get
+        r = requests.post(ADVISOR_URL, json={"symbol": symbol, "_action": "get"}, headers=headers, timeout=2.5)
+        return r.json()
+    except Exception as e:
+        print(f"[ADVISOR] fetch_effective fail: {e}")
+        return None
+    
+def blocked_by_cooldown() -> bool:
+    return (time.time() - last_action_ts) < MIN_TRADE_COOLDOWN_S if MIN_TRADE_COOLDOWN_S > 0 else False
+
+def is_duplicate_signal(action: str, source: str, price: float, tf: str) -> bool:
+    key = (action, source, round(price, 4), tf)
+    ts = last_signal_key_ts.get(key, 0.0)
+    if (time.time() - ts) <= DEDUP_WINDOW_S:
+        return True
+    last_signal_key_ts[key] = time.time()
+    return False
 
 # --- Flask ---
 app = Flask(__name__)
@@ -413,6 +448,8 @@ def config_view():
     def masked(s): 
         return bool(s)  # geen secrets tonen; alleen aangeven of iets gezet is
 
+    advisor_effective = advisor_fetch_effective(SYMBOL_STR) if (ADVISOR_ENABLED and ADVISOR_URL) else None
+
     return jsonify({
         "symbol": SYMBOL_STR,
         "timeframe_default": "1m",
@@ -435,8 +472,11 @@ def config_view():
         "capital": round(capital, 2),
         "sparen": round(sparen, 2),
         "totaalwaarde": round(capital + sparen, 2),
-        "last_action": datetime.fromtimestamp(last_action_ts).strftime("%d-%m-%Y %H:%M:%S") if last_action_ts > 0 else None
+        "last_action": datetime.fromtimestamp(last_action_ts).strftime("%d-%m-%Y %H:%M:%S") if last_action_ts > 0 else None,
+        # nieuw: toon wat de Advisor nu hanteert (zoals je in Postman zag: {"applied": {...}})
+        "advisor_effective": advisor_effective
     })
+
 
 if __name__ == "__main__":
     load_trades()  # probeer bestaande log in te lezen bij start
