@@ -186,28 +186,33 @@ def trend_ok(price: float) -> tuple[bool, float]:  # of -> Tuple[bool, float] + 
         return True, float("nan")
     
 def advisor_fetch_effective(symbol: str):
-    """Haal effectieve advisor-instellingen op (probeert GET en zo nodig POST fallback)."""
+    """Haal effectieve advisor-instellingen op; probeer eerst POST, dan GET."""
     if not (ADVISOR_ENABLED and ADVISOR_URL):
         return None
     headers = {"Content-Type": "application/json"}
     if ADVISOR_SECRET:
         headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
     try:
-        # 1) Probeer GET ?symbol=...
-        try:
-            r = requests.get(ADVISOR_URL, params={"symbol": symbol}, headers=headers, timeout=2.5)
-            if r.ok:
-                j = r.json()
-                if isinstance(j, dict):
-                    return j
-        except Exception:
-            pass
-        # 2) Fallback: POST naar hetzelfde endpoint met _action=get
-        r = requests.post(ADVISOR_URL, json={"symbol": symbol, "_action": "get"}, headers=headers, timeout=2.5)
-        return r.json()
+        # 1) POST (meest gebruikelijk bij jouw Advisor)
+        r = requests.post(ADVISOR_URL, json={"symbol": symbol}, headers=headers, timeout=2.5)
+        if r.ok:
+            try:
+                return r.json()
+            except Exception:
+                return {"ok": False, "error": "invalid_json_post"}
+
+        # 2) Fallback: GET ?symbol=...
+        r2 = requests.get(ADVISOR_URL, params={"symbol": symbol}, headers=headers, timeout=2.5)
+        if r2.ok:
+            try:
+                return r2.json()
+            except Exception:
+                return {"ok": False, "error": "invalid_json_get"}
+
+        return {"ok": False, "status": r.status_code, "error": r.text[:200]}
     except Exception as e:
         print(f"[ADVISOR] fetch_effective fail: {e}")
-        return None
+        return {"ok": False, "error": str(e)[:200]}
     
 def blocked_by_cooldown() -> bool:
     return (time.time() - last_action_ts) < MIN_TRADE_COOLDOWN_S if MIN_TRADE_COOLDOWN_S > 0 else False
