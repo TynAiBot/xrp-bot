@@ -443,6 +443,83 @@ def advisor_status():
         "manual_override": override
     })
 
+# --- Advisor proxy helpers (tweak/get) ---
+def _advisor_headers():
+    h = {"Content-Type": "application/json"}
+    if ADVISOR_SECRET:
+        h["Authorization"] = f"Bearer {ADVISOR_SECRET}"
+        h["X-Advisor-Secret"] = ADVISOR_SECRET  # extra compat
+    return h
+
+def _safe_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {"status": resp.status_code, "text": resp.text[:400]}
+
+@app.route("/advisor/get", methods=["GET", "POST"])
+def advisor_get():
+    if not (ADVISOR_ENABLED and ADVISOR_URL):
+        return jsonify({"ok": False, "error": "advisor_not_configured"}), 400
+    symbol = (request.get_json(silent=True) or {}).get("symbol", SYMBOL_STR)
+
+    attempts = []
+    # 1) POST _action=get
+    try:
+        r = requests.post(ADVISOR_URL, json={"_action": "get", "symbol": symbol},
+                          headers=_advisor_headers(), timeout=3)
+        j = _safe_json(r)
+        attempts.append({"variant": "post_action_get", "status": r.status_code, "resp": j})
+        if r.ok and isinstance(j, dict) and ("applied" in j or j.get("ok") is True):
+            return jsonify({"ok": True, "via": "post_action_get", "resp": j})
+    except Exception as e:
+        attempts.append({"variant": "post_action_get", "error": str(e)})
+
+    # 2) GET ?symbol=
+    try:
+        r = requests.get(ADVISOR_URL, params={"symbol": symbol},
+                         headers=_advisor_headers(), timeout=3)
+        j = _safe_json(r)
+        attempts.append({"variant": "get_query", "status": r.status_code, "resp": j})
+        if r.ok and isinstance(j, dict) and ("applied" in j or j.get("ok") is True):
+            return jsonify({"ok": True, "via": "get_query", "resp": j})
+    except Exception as e:
+        attempts.append({"variant": "get_query", "error": str(e)})
+
+    return jsonify({"ok": False, "attempts": attempts}), 502
+
+@app.route("/advisor/tweak", methods=["POST"])
+def advisor_tweak():
+    if not (ADVISOR_ENABLED and ADVISOR_URL):
+        return jsonify({"ok": False, "error": "advisor_not_configured"}), 400
+
+    body = request.get_json(force=True) or {}
+    symbol = body.get("symbol", SYMBOL_STR)
+    # zowel top-level als {"values": {...}} accepteren
+    values = body.get("values") if isinstance(body.get("values"), dict) else body
+
+    variants = [
+        {"_variant": "post_action_set_values", "_action": "set", "symbol": symbol, "values": values},
+        {"_variant": "post_action_set_top",    "_action": "set", "symbol": symbol, **values},
+        {"_variant": "post_plain_top",         "symbol": symbol, **values},
+    ]
+
+    attempts = []
+    for v in variants:
+        data = dict(v)  # copy
+        tag = data.pop("_variant", "unknown")
+        try:
+            r = requests.post(ADVISOR_URL, json=data, headers=_advisor_headers(), timeout=3)
+            j = _safe_json(r)
+            attempts.append({"variant": tag, "status": r.status_code, "resp": j})
+            # Succescriterium: server geeft 'applied' terug of ok==true (meer dan echo)
+            if r.ok and isinstance(j, dict) and ("applied" in j or j.get("ok") is True):
+                return jsonify({"ok": True, "used": tag, "resp": j})
+        except Exception as e:
+            attempts.append({"variant": tag, "error": str(e)})
+
+    return jsonify({"ok": False, "attempts": attempts}), 502
+
 @app.route("/advisor/set", methods=["POST"])
 def advisor_set():
     global ADVISOR_FAIL_MODE, ADVISOR_MANUAL_OVERRIDE
