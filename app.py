@@ -9,6 +9,7 @@ import requests
 import ccxt
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from typing import Tuple
 
 load_dotenv()
 
@@ -53,6 +54,11 @@ capital = START_CAPITAL
 sparen  = SPAREN_START
 last_action_ts = 0.0
 last_signal_key_ts = {}     # (action, source, round(price,4), tf) -> ts
+# Advisor runtime config (aanpasbaar via endpoints)
+ADVISOR_FAIL_MODE = os.getenv("ADVISOR_FAIL_MODE", "open")  # 'open' = toestaan bij storing, 'closed' = blokkeren
+ADVISOR_ALLOW_SOURCES = set()   # bv. {"bollinger_band","ichimoku"} -> alleen deze bronnen toegestaan
+ADVISOR_BLOCK_SOURCES = set()   # bv. {"rsi"} -> deze bronnen blokkeren
+ADVISOR_MANUAL_OVERRIDE = None  # dict {mode:"allow"|"block", until:epoch, reason:str}
 
 # Persistente logging
 TRADES_FILE = os.getenv("TRADES_FILE", "trades.json")
@@ -74,50 +80,56 @@ def send_tg(text_html: str):
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
-def advisor_allows(action: str, price: float, source: str, tf: str) -> (bool, str):
-    """Vraagt toestemming bij de Multi-Bot Advisor. Fallback = toestaan."""
-    if not ADVISOR_ENABLED or not ADVISOR_URL:
-        return True, "advisor_off"
-    payload = {"symbol": SYMBOL_STR, "action": action, "price": price, "source": source, "timeframe": tf}
-    headers = {"Content-Type": "application/json"}
-    if ADVISOR_SECRET:
-        headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
-    try:
-        r = requests.post(ADVISOR_URL, json=payload, headers=headers, timeout=2.5)
+def advisor_allows(action: str, price: float, source: str, tf: str) -> Tuple[bool, str]:
+    """
+    Toestemming via Multi-Bot Advisor met lokale overrides/fail-modes.
+    Volgorde:
+      1) Handmatige override (tijdelijk allow/block)
+      2) Source allow/block lijsten
+      3) Externe Advisor-call (indien enabled)
+      4) Fail-mode (open/closed) bij storing
+    """
+    # 1) Handmatige override
+    if ADVISOR_MANUAL_OVERRIDE:
         try:
-            j = r.json()
+            if time.time() <= ADVISOR_MANUAL_OVERRIDE.get("until", 0):
+                mode = ADVISOR_MANUAL_OVERRIDE.get("mode", "allow")
+                reason = f"manual_{mode}:" + ADVISOR_MANUAL_OVERRIDE.get("reason", "")
+                return (mode == "allow"), reason
         except Exception:
-            j = {}
-        allow  = bool(j.get("approve", j.get("allow", True)))
-        reason = str(j.get("reason", f"status_{r.status_code}"))
-        return allow, reason
-    except Exception as e:
-        print(f"[ADVISOR] unreachable: {e}")
-        return True, "advisor_unreachable"
+            pass
 
-def trend_ok(price: float) -> (bool, float):
-    """MA200: koop alleen boven MA200 (1m). Bij fout niet blokkeren."""
-    if not USE_TREND_FILTER or exchange is None:
-        return True, float("nan")
-    try:
-        ohlcv = exchange.fetch_ohlcv(SYMBOL_TV, timeframe="1m", limit=210)
-        closes = [c[4] for c in ohlcv]
-        ma200 = sum(closes[-200:]) / 200.0
-        return price > ma200, ma200
-    except Exception as e:
-        print(f"[TREND] fetch fail: {e}")
-        return True, float("nan")
+    # 2) Source allow/block
+    src = (source or "").lower()
+    if ADVISOR_ALLOW_SOURCES and src not in ADVISOR_ALLOW_SOURCES:
+        return False, "src_not_allowed"
+    if ADVISOR_BLOCK_SOURCES and src in ADVISOR_BLOCK_SOURCES:
+        return False, "src_blocked"
 
-def blocked_by_cooldown() -> bool:
-    return (time.time() - last_action_ts) < MIN_TRADE_COOLDOWN_S if MIN_TRADE_COOLDOWN_S > 0 else False
+    # 3) Externe Advisor
+    if ADVISOR_ENABLED and ADVISOR_URL:
+        payload = {"symbol": SYMBOL_STR, "action": action, "price": price, "source": source, "timeframe": tf}
+        headers = {"Content-Type": "application/json"}
+        if ADVISOR_SECRET:
+            headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
+        try:
+            r = requests.post(ADVISOR_URL, json=payload, headers=headers, timeout=2.5)
+            try:
+                j = r.json()
+            except Exception:
+                j = {}
+            allow  = bool(j.get("approve", j.get("allow", True)))
+            reason = str(j.get("reason", f"status_{r.status_code}"))
+            return allow, reason
+        except Exception as e:
+            print(f"[ADVISOR] unreachable: {e}")
+            # val door naar fail-mode
 
-def is_duplicate_signal(action: str, source: str, price: float, tf: str) -> bool:
-    key = (action, source, round(price, 4), tf)
-    ts = last_signal_key_ts.get(key, 0.0)
-    if (time.time() - ts) <= DEDUP_WINDOW_S:
-        return True
-    last_signal_key_ts[key] = time.time()
-    return False
+    # 4) Fail-mode
+    if ADVISOR_FAIL_MODE == "closed":
+        return False, "fail_closed"
+    return True, "fail_open"
+
 
 # --- Persistente log helpers ---
 def load_trades():
@@ -159,6 +171,19 @@ def log_trade(action: str, price: float, winst: float, source: str, tf: str):
     if len(trade_log) > 2000:
         trade_log[:] = trade_log[-2000:]
     save_trades()
+
+def trend_ok(price: float) -> tuple[bool, float]:  # of -> Tuple[bool, float] + import
+    """MA200: koop alleen boven MA200 (1m). Bij fout niet blokkeren."""
+    if not USE_TREND_FILTER or exchange is None:
+        return True, float("nan")
+    try:
+        ohlcv = exchange.fetch_ohlcv(SYMBOL_TV, timeframe="1m", limit=210)
+        closes = [c[4] for c in ohlcv]
+        ma200 = sum(closes[-200:]) / 200.0
+        return price > ma200, ma200
+    except Exception as e:
+        print(f"[TREND] fetch fail: {e}")
+        return True, float("nan")
 
 # --- Flask ---
 app = Flask(__name__)
@@ -319,12 +344,99 @@ def report_save():
     save_trades()
     return jsonify({"saved": True, "file": TRADES_FILE, "count": len(trade_log)})
 
+@app.route("/advisor/status", methods=["GET"])
+def advisor_status():
+    now = time.time()
+    override = None
+    if ADVISOR_MANUAL_OVERRIDE and now <= ADVISOR_MANUAL_OVERRIDE.get("until", 0):
+        override = {
+            "mode": ADVISOR_MANUAL_OVERRIDE.get("mode"),
+            "until": ADVISOR_MANUAL_OVERRIDE.get("until"),
+            "seconds_left": round(ADVISOR_MANUAL_OVERRIDE.get("until") - now, 1),
+            "reason": ADVISOR_MANUAL_OVERRIDE.get("reason", "")
+        }
+    return jsonify({
+        "enabled": ADVISOR_ENABLED,
+        "url_set": bool(ADVISOR_URL),
+        "secret_set": bool(ADVISOR_SECRET),
+        "fail_mode": ADVISOR_FAIL_MODE,  # 'open' of 'closed'
+        "allow_sources": sorted(list(ADVISOR_ALLOW_SOURCES)) if ADVISOR_ALLOW_SOURCES else [],
+        "block_sources": sorted(list(ADVISOR_BLOCK_SOURCES)) if ADVISOR_BLOCK_SOURCES else [],
+        "manual_override": override
+    })
+
+@app.route("/advisor/set", methods=["POST"])
+def advisor_set():
+    global ADVISOR_FAIL_MODE, ADVISOR_MANUAL_OVERRIDE, ADVISOR_ALLOW_SOURCES, ADVISOR_BLOCK_SOURCES
+    data = request.get_json(force=True, silent=True) or {}
+
+    # Basis toggle/config
+    if "enabled" in data:
+        globals()["ADVISOR_ENABLED"] = bool(data["enabled"])
+    if "url" in data:
+        globals()["ADVISOR_URL"] = str(data["url"]).strip()
+    if "secret" in data:
+        globals()["ADVISOR_SECRET"] = str(data["secret"]).strip()
+    if data.get("fail_mode") in ("open", "closed"):
+        ADVISOR_FAIL_MODE = data["fail_mode"]
+
+    # Allow/Block lijsten
+    if "allow_sources" in data:
+        ADVISOR_ALLOW_SOURCES = set([str(s).lower() for s in (data.get("allow_sources") or [])])
+    if "block_sources" in data:
+        ADVISOR_BLOCK_SOURCES = set([str(s).lower() for s in (data.get("block_sources") or [])])
+
+    # Tijdelijke manual override: {"override":{"mode":"allow"|"block","seconds":600,"reason":"..."}}
+    if isinstance(data.get("override"), dict):
+        ov = data["override"]
+        mode = ov.get("mode", "allow")
+        if mode in ("allow", "block"):
+            secs = int(ov.get("seconds", 0))
+            if secs > 0:
+                ADVISOR_MANUAL_OVERRIDE = {
+                    "mode": mode,
+                    "until": time.time() + secs,
+                    "reason": str(ov.get("reason", ""))
+                }
+            else:
+                ADVISOR_MANUAL_OVERRIDE = None
+
+    return advisor_status()
 
 def idle_worker():
     # plek voor periodieke taken (bijv. future trailing/pings)
     while True:
         time.sleep(60)
 
+@app.route("/config", methods=["GET"])
+def config_view():
+    def masked(s): 
+        return bool(s)  # geen secrets tonen; alleen aangeven of iets gezet is
+
+    return jsonify({
+        "symbol": SYMBOL_STR,
+        "timeframe_default": "1m",
+        "live_mode": LIVE_MODE,
+        "start_capital": START_CAPITAL,
+        "sparen_start": SPAREN_START,
+        "savings_split": SAVINGS_SPLIT,          # 1.0 = 100% winst naar spaar
+        "cooldown_s": MIN_TRADE_COOLDOWN_S,
+        "dedup_window_s": DEDUP_WINDOW_S,
+        "use_trend_filter": USE_TREND_FILTER,
+        "advisor_enabled": ADVISOR_ENABLED,
+        "advisor_url_set": bool(ADVISOR_URL),
+        "advisor_secret_set": masked(ADVISOR_SECRET),
+        "webhook_secret_set": masked(WEBHOOK_SECRET),
+        "telegram_config_ok": bool(TG_TOKEN and TG_CHAT_ID),
+        "trades_file": TRADES_FILE,
+        # runtime state
+        "in_position": in_position,
+        "entry_price": round(entry_price, 4),
+        "capital": round(capital, 2),
+        "sparen": round(sparen, 2),
+        "totaalwaarde": round(capital + sparen, 2),
+        "last_action": datetime.fromtimestamp(last_action_ts).strftime("%d-%m-%Y %H:%M:%S") if last_action_ts > 0 else None
+    })
 
 if __name__ == "__main__":
     load_trades()  # probeer bestaande log in te lezen bij start
