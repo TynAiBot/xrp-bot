@@ -354,24 +354,16 @@ def webhook():
         last_action_ts = time.time()
 
         send_tg(
-            "🟢 <b>[XRP/USDT] AANKOOP</b>
-"
-            f"📹 Koopprijs: ${price:.4f}
-"
-            f"🧠 Signaalbron: {source} | {advisor_reason}
-"
-            f"🕒 TF: {tf}
-"
-            f"💰 Handelssaldo: €{capital:.2f}
-"
-            f"💼 Spaarrekening: €{sparen:.2f}
-"
-            f"📈 Totale waarde: €{capital + sparen:.2f}
-"
-            f"🔐 Tradebedrag: €{START_CAPITAL:.2f}
-"
-            f"🔗 Tijd: {timestamp}"
-        )
+    f"""🟢 <b>[XRP/USDT] AANKOOP</b>
+📹 Koopprijs: ${price:.4f}
+🧠 Signaalbron: {source} | {advisor_reason}
+🕒 TF: {tf}
+💰 Handelssaldo: €{capital:.2f}
+💼 Spaarrekening: €{sparen:.2f}
+📈 Totale waarde: €{capital + sparen:.2f}
+🔐 Tradebedrag: €{START_CAPITAL:.2f}
+🔗 Tijd: {timestamp}"""
+)
 
         log_trade("buy", price, 0.0, source, tf)
         return "OK", 200
@@ -402,26 +394,17 @@ def webhook():
 
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
         send_tg(
-            "📄 <b>[XRP/USDT] VERKOOP</b>
-"
-            f"📹 Verkoopprijs: ${price:.4f}
-"
-            f"🧠 Signaalbron: {source} | {advisor_reason}
-"
-            f"🕒 TF: {tf}
-"
-            f"💰 Handelssaldo: €{capital:.2f}
-"
-            f"💼 Spaarrekening: €{sparen:.2f}
-"
-            f"📈 {resultaat}: €{winst_bedrag:.2f}
-"
-            f"📈 Totale waarde: €{capital + sparen:.2f}
-"
-            f"🔐 Tradebedrag: €{START_CAPITAL:.2f}
-"
-            f"🔗 Tijd: {timestamp}"
-        )
+    f"""📄 <b>[XRP/USDT] VERKOOP</b>
+📹 Verkoopprijs: ${price:.4f}
+🧠 Signaalbron: {source} | {advisor_reason}
+🕒 TF: {tf}
+💰 Handelssaldo: €{capital:.2f}
+💼 Spaarrekening: €{sparen:.2f}
+📈 {"Winst" if winst_bedrag >= 0 else "Verlies"}: €{winst_bedrag:.2f}
+📈 Totale waarde: €{capital + sparen:.2f}
+🔐 Tradebedrag: €{START_CAPITAL:.2f}
+🔗 Tijd: {timestamp}"""
+)
 
         log_trade("sell", price, winst_bedrag, source, tf)
         entry_price = 0.0
