@@ -1,5 +1,5 @@
-# app.py — XRP single-bot (1m) met Advisor + trendfilter + cooldown/de-dup
-# + Persistente trade-logging (JSON-bestand) + /report/daily en /report/weekly
+# app.py — XRP single-bot (1m) met Advisor (embedded) + trendfilter + cooldown/de-dup
+# + Persistente trade-logging (JSON-bestand) + /report/daily en /report/weekly + /advisor admin
 
 import os, time, json
 from datetime import datetime, timedelta
@@ -9,7 +9,6 @@ import requests
 import ccxt
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from typing import Tuple
 
 load_dotenv()
 
@@ -30,7 +29,7 @@ DEDUP_WINDOW_S       = int(os.getenv("DEDUP_WINDOW_S",       "30"))  # dezelfde 
 # Trendfilter
 USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"         # MA200 only-long op BUY
 
-# Advisor standaard AAN
+# Advisor AAN
 ADVISOR_ENABLED = os.getenv("ADVISOR_ENABLED", "1") == "1"
 ADVISOR_URL     = os.getenv("ADVISOR_URL", "")
 ADVISOR_SECRET  = os.getenv("ADVISOR_SECRET", "")
@@ -54,15 +53,89 @@ capital = START_CAPITAL
 sparen  = SPAREN_START
 last_action_ts = 0.0
 last_signal_key_ts = {}     # (action, source, round(price,4), tf) -> ts
-# Advisor runtime config (aanpasbaar via endpoints)
-ADVISOR_FAIL_MODE = os.getenv("ADVISOR_FAIL_MODE", "open")  # 'open' = toestaan bij storing, 'closed' = blokkeren
-ADVISOR_ALLOW_SOURCES = set()   # bv. {"bollinger_band","ichimoku"} -> alleen deze bronnen toegestaan
-ADVISOR_BLOCK_SOURCES = set()   # bv. {"rsi"} -> deze bronnen blokkeren
-ADVISOR_MANUAL_OVERRIDE = None  # dict {mode:"allow"|"block", until:epoch, reason:str}
 
 # Persistente logging
 TRADES_FILE = os.getenv("TRADES_FILE", "trades.json")
 trade_log = []  # lijst van dicts met buy/sell
+
+# =========================
+# Embedded Advisor (zelfde service, geen extra Render nodig)
+# =========================
+ADVISOR_STORE   = os.getenv("ADVISOR_STORE", "advisor_store.json")
+ADVISOR_DEFAULTS = {
+    "BUY_THRESHOLD":   0.41,
+    "SELL_THRESHOLD":  0.56,
+    "TAKE_PROFIT_PCT": 0.026,
+    "STOP_LOSS_PCT":   0.020,
+    "USE_TRAILING":    True,
+    "TRAIL_PCT":       0.010,
+    "DIRECT_TPSL":     True,
+    "ARM_AT_PCT":      0.005,
+    "MIN_MOVE_PCT":    0.001,
+}
+# persistent state: { "symbols": { "XRPUSDT": {"applied": {...}, "ts": epoch} }, "updated": ts }
+ADVISOR_STATE = {"symbols": {}, "updated": 0}
+
+def _advisor_load():
+    global ADVISOR_STATE
+    try:
+        if os.path.exists(ADVISOR_STORE):
+            with open(ADVISOR_STORE, "r", encoding="utf-8") as f:
+                j = json.load(f)
+            if isinstance(j, dict):
+                ADVISOR_STATE = j
+            else:
+                ADVISOR_STATE = {"symbols": {}, "updated": 0}
+        else:
+            ADVISOR_STATE = {"symbols": {}, "updated": 0}
+    except Exception:
+        ADVISOR_STATE = {"symbols": {}, "updated": 0}
+
+def _advisor_save():
+    try:
+        tmp = ADVISOR_STORE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(ADVISOR_STATE, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, ADVISOR_STORE)
+    except Exception as e:
+        print("[ADVISOR_STORE] save error:", e)
+
+def _advisor_applied(symbol: str) -> dict:
+    s = (symbol or "").upper().strip() or SYMBOL_STR
+    sm = ADVISOR_STATE.setdefault("symbols", {})
+    rec = sm.get(s)
+    if not isinstance(rec, dict) or not isinstance(rec.get("applied"), dict):
+        sm[s] = {"applied": dict(ADVISOR_DEFAULTS), "ts": int(time.time())}
+        ADVISOR_STATE["updated"] = sm[s]["ts"]
+        _advisor_save()
+    return sm[s]["applied"]
+
+def _advisor_auth_ok(req) -> bool:
+    if not ADVISOR_SECRET:
+        return True
+    h = req.headers.get("Authorization", "").strip()
+    if h.lower().startswith("bearer ") and h.split(" ", 1)[1] == ADVISOR_SECRET:
+        return True
+    if req.headers.get("X-Advisor-Secret", "") == ADVISOR_SECRET:
+        return True
+    return False
+
+def _advisor_coerce(vals: dict) -> dict:
+    out = {}
+    for k, v in (vals or {}).items():
+        K = str(k).upper()
+        if K in {"USE_TRAILING", "DIRECT_TPSL"}:
+            out[K] = bool(v) if isinstance(v, bool) else str(v).strip().lower() in {"1","true","yes","y","on"}
+        elif K in ADVISOR_DEFAULTS:
+            try:
+                out[K] = round(float(v), 3)
+            except Exception:
+                pass
+    return out
+
+# Als ADVISOR_URL leeg is, wijs naar onze eigen /advisor (localhost) zodat alles 1 service blijft.
+if not ADVISOR_URL:
+    ADVISOR_URL = f"http://127.0.0.1:{os.getenv('PORT','5000')}/advisor"
 
 # --- Helpers ---
 def now_str():
@@ -80,58 +153,50 @@ def send_tg(text_html: str):
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
-from typing import Tuple  # staat al bij jou
-
-def advisor_allows(action: str, price: float, source: str, tf: str) -> Tuple[bool, str]:
-    """
-    Toestemming via Multi-Bot Advisor met lokale overrides/fail-modes.
-    Volgorde:
-      1) Handmatige override (tijdelijk allow/block)
-      2) Source allow/block lijsten
-      3) Externe Advisor-call (indien enabled)
-      4) Fail-mode (open/closed) bij storing
-    """
-    # 1) Handmatige override
-    if ADVISOR_MANUAL_OVERRIDE:
+def advisor_allows(action: str, price: float, source: str, tf: str) -> (bool, str):
+    """Vraag Advisor (lokale /advisor of externe). Fallback = toestaan."""
+    if not ADVISOR_ENABLED or not ADVISOR_URL:
+        return True, "advisor_off"
+    payload = {"symbol": SYMBOL_STR, "action": action, "price": price, "source": source, "timeframe": tf}
+    headers = {"Content-Type": "application/json"}
+    if ADVISOR_SECRET:
+        headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
+    try:
+        r = requests.post(ADVISOR_URL, json=payload, headers=headers, timeout=2.5)
         try:
-            if time.time() <= ADVISOR_MANUAL_OVERRIDE.get("until", 0):
-                mode = ADVISOR_MANUAL_OVERRIDE.get("mode", "allow")
-                reason = f"manual_{mode}:" + ADVISOR_MANUAL_OVERRIDE.get("reason", "")
-                return (mode == "allow"), reason
+            j = r.json()
         except Exception:
-            pass
+            j = {}
+        allow  = bool(j.get("approve", j.get("allow", True)))
+        reason = str(j.get("reason", f"status_{r.status_code}"))
+        return allow, reason
+    except Exception as e:
+        print(f"[ADVISOR] unreachable: {e}")
+        return True, "advisor_unreachable"
 
-    # 2) Source allow/block
-    src = (source or "").lower()
-    if ADVISOR_ALLOW_SOURCES and src not in ADVISOR_ALLOW_SOURCES:
-        return False, "src_not_allowed"
-    if ADVISOR_BLOCK_SOURCES and src in ADVISOR_BLOCK_SOURCES:
-        return False, "src_blocked"
+def trend_ok(price: float) -> (bool, float):
+    """MA200: koop alleen boven MA200 (1m). Bij fout niet blokkeren."""
+    if not USE_TREND_FILTER or exchange is None:
+        return True, float("nan")
+    try:
+        ohlcv = exchange.fetch_ohlcv(SYMBOL_TV, timeframe="1m", limit=210)
+        closes = [c[4] for c in ohlcv]
+        ma200 = sum(closes[-200:]) / 200.0
+        return price > ma200, ma200
+    except Exception as e:
+        print(f"[TREND] fetch fail: {e}")
+        return True, float("nan")
 
-    # 3) Externe Advisor
-    if ADVISOR_ENABLED and ADVISOR_URL:
-        payload = {"symbol": SYMBOL_STR, "action": action, "price": price, "source": source, "timeframe": tf}
-        headers = {"Content-Type": "application/json"}
-        if ADVISOR_SECRET:
-            headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
-        try:
-            r = requests.post(ADVISOR_URL, json=payload, headers=headers, timeout=2.5)
-            if r.status_code >= 400:
-                print(f"[ADVISOR] HTTP {r.status_code} -> {r.text[:300]}")
-            try:
-                j = r.json()
-            except Exception:
-                j = {}
-            allow  = bool(j.get("approve", j.get("allow", True)))
-            reason = str(j.get("reason", f"status_{r.status_code}"))
-            return allow, reason
-        except Exception as e:
-            print(f"[ADVISOR] unreachable: {e}")
+def blocked_by_cooldown() -> bool:
+    return (time.time() - last_action_ts) < MIN_TRADE_COOLDOWN_S if MIN_TRADE_COOLDOWN_S > 0 else False
 
-    # 4) Fail-mode
-    if ADVISOR_FAIL_MODE == "closed":
-        return False, "fail_closed"
-    return True, "fail_open"
+def is_duplicate_signal(action: str, source: str, price: float, tf: str) -> bool:
+    key = (action, source, round(price, 4), tf)
+    ts = last_signal_key_ts.get(key, 0.0)
+    if (time.time() - ts) <= DEDUP_WINDOW_S:
+        return True
+    last_signal_key_ts[key] = time.time()
+    return False
 
 # --- Persistente log helpers ---
 def load_trades():
@@ -169,102 +234,71 @@ def log_trade(action: str, price: float, winst: float, source: str, tf: str):
         "capital": round(capital, 2),
         "sparen": round(sparen, 2)
     })
-    # optioneel: max 2000 trades bewaren in geheugen
     if len(trade_log) > 2000:
         trade_log[:] = trade_log[-2000:]
     save_trades()
 
-def trend_ok(price: float) -> Tuple[bool, float]:
-    """MA200: koop alleen boven MA200 (1m). Bij fout niet blokkeren."""
-    if not USE_TREND_FILTER or exchange is None:
-        return True, float("nan")
-    try:
-        ohlcv = exchange.fetch_ohlcv(SYMBOL_TV, timeframe="1m", limit=210)
-        closes = [c[4] for c in ohlcv]
-        ma200 = sum(closes[-200:]) / 200.0
-        return price > ma200, ma200
-    except Exception as e:
-        print(f"[TREND] fetch fail: {e}")
-        return True, float("nan")
-    
-def advisor_fetch_effective(symbol: str):
-    """Haal effectieve advisor-instellingen op (probeer POST _action=get, POST plain, dan GET)."""
-    if not (ADVISOR_ENABLED and ADVISOR_URL):
-        return None
-
-    # Bouw headers – sommige Advisors accepteren 'Authorization', anderen 'X-Advisor-Secret'
-    headers = {"Content-Type": "application/json"}
-    if ADVISOR_SECRET:
-        headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
-        headers["X-Advisor-Secret"] = ADVISOR_SECRET  # extra compat
-
-    def try_json(resp):
-        try:
-            return resp.json()
-        except Exception:
-            return {"ok": False, "status": resp.status_code, "error": resp.text[:200]}
-
-    try:
-        # 1) POST met _action=get
-        try:
-            r = requests.post(
-                ADVISOR_URL,
-                json={"symbol": symbol, "_action": "get"},
-                headers=headers,
-                timeout=2.5,
-            )
-            if r.ok:
-                return try_json(r)
-            # Laat debug-info zien als unauthorized of andere fout
-            if r.status_code == 401:
-                print(f"[ADVISOR] POST _action=get -> 401 Unauthorized")
-            else:
-                print(f"[ADVISOR] POST _action=get -> {r.status_code}: {r.text[:200]}")
-        except Exception as e:
-            print(f"[ADVISOR] fetch POST _action=get fail: {e}")
-
-        # 2) POST zonder _action
-        try:
-            r2 = requests.post(
-                ADVISOR_URL,
-                json={"symbol": symbol},
-                headers=headers,
-                timeout=2.5,
-            )
-            if r2.ok:
-                return try_json(r2)
-            if r2.status_code == 401:
-                print(f"[ADVISOR] POST symbol -> 401 Unauthorized")
-            else:
-                print(f"[ADVISOR] POST symbol -> {r2.status_code}: {r2.text[:200]}")
-        except Exception as e:
-            print(f"[ADVISOR] fetch POST symbol fail: {e}")
-
-        # 3) GET ?symbol=...
-        try:
-            r3 = requests.get(
-                ADVISOR_URL,
-                params={"symbol": symbol},
-                headers=headers,
-                timeout=2.5,
-            )
-            if r3.ok:
-                return try_json(r3)
-            if r3.status_code == 401:
-                print(f"[ADVISOR] GET symbol -> 401 Unauthorized")
-            else:
-                print(f"[ADVISOR] GET symbol -> {r3.status_code}: {r3.text[:200]}")
-        except Exception as e:
-            print(f"[ADVISOR] fetch GET fail: {e}")
-
-        # Geen succes
-        return {"ok": False, "error": "no_successful_variant"}
-    except Exception as e:
-        print(f"[ADVISOR] fetch_effective unexpected fail: {e}")
-        return {"ok": False, "error": str(e)[:200]}
-
 # --- Flask ---
 app = Flask(__name__)
+
+# ===== Embedded Advisor endpoints =====
+@app.route("/advisor", methods=["GET","POST"])
+def advisor_endpoint():
+    """
+    GET  /advisor?symbol=XRPUSDT   -> applied (geen auth)
+    POST {"_action":"get","symbol":"XRPUSDT"} -> applied (geen auth)
+    POST {"action":"buy|sell",...} -> approve open + applied echo (zoals bot gebruikt)
+    """
+    try:
+        if request.method == "GET":
+            sym = request.args.get("symbol", SYMBOL_STR)
+            return jsonify({"ok": True, "applied": _advisor_applied(sym)})
+
+        data = request.get_json(force=True, silent=True) or {}
+        if str(data.get("_action","")).lower() == "get":
+            sym = data.get("symbol", SYMBOL_STR)
+            return jsonify({"ok": True, "applied": _advisor_applied(sym)})
+
+        # approval pad (we blokkeren hier niets)
+        sym = data.get("symbol", SYMBOL_STR)
+        act = str(data.get("action","")).lower()
+        if act not in {"buy","sell"}:
+            return jsonify({"ok": False, "error": "bad_payload"}), 400
+        return jsonify({"ok": True, "approve": True, "reason": "open", "applied": _advisor_applied(sym)})
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+
+
+@app.route("/advisor/admin/get", methods=["POST"])
+def advisor_admin_get():
+    if not _advisor_auth_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    sym = data.get("symbol", SYMBOL_STR)
+    return jsonify({"ok": True, "applied": _advisor_applied(sym)})
+
+
+@app.route("/advisor/admin/set", methods=["POST"])
+def advisor_admin_set():
+    if not _advisor_auth_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    sym = (data.get("symbol") or SYMBOL_STR).upper().strip()
+    raw = data.get("values") or data.get("changes") or {}
+    vals = _advisor_coerce(raw)
+    ap = _advisor_applied(sym)
+    ap.update(vals)
+    ADVISOR_STATE["symbols"][sym] = {"applied": ap, "ts": int(time.time())}
+    ADVISOR_STATE["updated"] = ADVISOR_STATE["symbols"][sym]["ts"]
+    _advisor_save()
+    return jsonify({"ok": True, "applied": ap})
+
+
+@app.route("/advisor/tweak", methods=["POST"])  # alias
+def advisor_admin_tweak():
+    return advisor_admin_set()
+
 
 @app.route("/health")
 def health():
@@ -320,18 +354,25 @@ def webhook():
         last_action_ts = time.time()
 
         send_tg(
-            "🟢 <b>[XRP/USDT] AANKOOP</b>\n"
-            f"📹 Koopprijs: ${price:.4f}\n"
-            f"🧠 Signaalbron: {source} | {advisor_reason}\n"
-            f"🕒 TF: {tf}\n"
-            f"💰 Handelssaldo: €{capital:.2f}\n"
-            f"💼 Spaarrekening: €{sparen:.2f}\n"
-            f"📈 Totale waarde: €{capital + sparen:.2f}\n"
-            f"🔐 Tradebedrag: €{START_CAPITAL:.2f}\n"
+            "🟢 <b>[XRP/USDT] AANKOOP</b>
+"
+            f"📹 Koopprijs: ${price:.4f}
+"
+            f"🧠 Signaalbron: {source} | {advisor_reason}
+"
+            f"🕒 TF: {tf}
+"
+            f"💰 Handelssaldo: €{capital:.2f}
+"
+            f"💼 Spaarrekening: €{sparen:.2f}
+"
+            f"📈 Totale waarde: €{capital + sparen:.2f}
+"
+            f"🔐 Tradebedrag: €{START_CAPITAL:.2f}
+"
             f"🔗 Tijd: {timestamp}"
         )
 
-        # log (winst = 0 bij buy)
         log_trade("buy", price, 0.0, source, tf)
         return "OK", 200
 
@@ -361,19 +402,27 @@ def webhook():
 
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
         send_tg(
-            "📄 <b>[XRP/USDT] VERKOOP</b>\n"
-            f"📹 Verkoopprijs: ${price:.4f}\n"
-            f"🧠 Signaalbron: {source} | {advisor_reason}\n"
-            f"🕒 TF: {tf}\n"
-            f"💰 Handelssaldo: €{capital:.2f}\n"
-            f"💼 Spaarrekening: €{sparen:.2f}\n"
-            f"📈 {resultaat}: €{winst_bedrag:.2f}\n"
-            f"📈 Totale waarde: €{capital + sparen:.2f}\n"
-            f"🔐 Tradebedrag: €{START_CAPITAL:.2f}\n"
+            "📄 <b>[XRP/USDT] VERKOOP</b>
+"
+            f"📹 Verkoopprijs: ${price:.4f}
+"
+            f"🧠 Signaalbron: {source} | {advisor_reason}
+"
+            f"🕒 TF: {tf}
+"
+            f"💰 Handelssaldo: €{capital:.2f}
+"
+            f"💼 Spaarrekening: €{sparen:.2f}
+"
+            f"📈 {resultaat}: €{winst_bedrag:.2f}
+"
+            f"📈 Totale waarde: €{capital + sparen:.2f}
+"
+            f"🔐 Tradebedrag: €{START_CAPITAL:.2f}
+"
             f"🔗 Tijd: {timestamp}"
         )
 
-        # log (winst/verlies vastleggen)
         log_trade("sell", price, winst_bedrag, source, tf)
         entry_price = 0.0
         return "OK", 200
@@ -422,187 +471,46 @@ def report_save():
     save_trades()
     return jsonify({"saved": True, "file": TRADES_FILE, "count": len(trade_log)})
 
-@app.route("/advisor/status", methods=["GET"])
-def advisor_status():
-    now = time.time()
-    override = None
-    if ADVISOR_MANUAL_OVERRIDE and now <= ADVISOR_MANUAL_OVERRIDE.get("until", 0):
-        override = {
-            "mode": ADVISOR_MANUAL_OVERRIDE.get("mode"),
-            "until": ADVISOR_MANUAL_OVERRIDE.get("until"),
-            "seconds_left": round(ADVISOR_MANUAL_OVERRIDE.get("until") - now, 1),
-            "reason": ADVISOR_MANUAL_OVERRIDE.get("reason", "")
-        }
-    return jsonify({
-        "enabled": ADVISOR_ENABLED,
-        "url_set": bool(ADVISOR_URL),
-        "secret_set": bool(ADVISOR_SECRET),
-        "fail_mode": ADVISOR_FAIL_MODE,  # 'open' of 'closed'
-        "allow_sources": sorted(list(ADVISOR_ALLOW_SOURCES)) if ADVISOR_ALLOW_SOURCES else [],
-        "block_sources": sorted(list(ADVISOR_BLOCK_SOURCES)) if ADVISOR_BLOCK_SOURCES else [],
-        "manual_override": override
-    })
-
-# --- Advisor proxy helpers (tweak/get) ---
-def _advisor_headers():
-    h = {"Content-Type": "application/json"}
-    if ADVISOR_SECRET:
-        h["Authorization"] = f"Bearer {ADVISOR_SECRET}"
-        h["X-Advisor-Secret"] = ADVISOR_SECRET  # extra compat
-    return h
-
-def _safe_json(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return {"status": resp.status_code, "text": resp.text[:400]}
-
-@app.route("/advisor/get", methods=["GET", "POST"])
-def advisor_get():
-    if not (ADVISOR_ENABLED and ADVISOR_URL):
-        return jsonify({"ok": False, "error": "advisor_not_configured"}), 400
-    symbol = (request.get_json(silent=True) or {}).get("symbol", SYMBOL_STR)
-
-    attempts = []
-    # 1) POST _action=get
-    try:
-        r = requests.post(ADVISOR_URL, json={"_action": "get", "symbol": symbol},
-                          headers=_advisor_headers(), timeout=3)
-        j = _safe_json(r)
-        attempts.append({"variant": "post_action_get", "status": r.status_code, "resp": j})
-        if r.ok and isinstance(j, dict) and ("applied" in j or j.get("ok") is True):
-            return jsonify({"ok": True, "via": "post_action_get", "resp": j})
-    except Exception as e:
-        attempts.append({"variant": "post_action_get", "error": str(e)})
-
-    # 2) GET ?symbol=
-    try:
-        r = requests.get(ADVISOR_URL, params={"symbol": symbol},
-                         headers=_advisor_headers(), timeout=3)
-        j = _safe_json(r)
-        attempts.append({"variant": "get_query", "status": r.status_code, "resp": j})
-        if r.ok and isinstance(j, dict) and ("applied" in j or j.get("ok") is True):
-            return jsonify({"ok": True, "via": "get_query", "resp": j})
-    except Exception as e:
-        attempts.append({"variant": "get_query", "error": str(e)})
-
-    return jsonify({"ok": False, "attempts": attempts}), 502
-
-@app.route("/advisor/tweak", methods=["POST"])
-def advisor_tweak():
-    if not (ADVISOR_ENABLED and ADVISOR_URL):
-        return jsonify({"ok": False, "error": "advisor_not_configured"}), 400
-
-    body = request.get_json(force=True) or {}
-    symbol = body.get("symbol", SYMBOL_STR)
-    # zowel top-level als {"values": {...}} accepteren
-    values = body.get("values") if isinstance(body.get("values"), dict) else body
-
-    variants = [
-        {"_variant": "post_action_set_values", "_action": "set", "symbol": symbol, "values": values},
-        {"_variant": "post_action_set_top",    "_action": "set", "symbol": symbol, **values},
-        {"_variant": "post_plain_top",         "symbol": symbol, **values},
-    ]
-
-    attempts = []
-    for v in variants:
-        data = dict(v)  # copy
-        tag = data.pop("_variant", "unknown")
-        try:
-            r = requests.post(ADVISOR_URL, json=data, headers=_advisor_headers(), timeout=3)
-            j = _safe_json(r)
-            attempts.append({"variant": tag, "status": r.status_code, "resp": j})
-            # Succescriterium: server geeft 'applied' terug of ok==true (meer dan echo)
-            if r.ok and isinstance(j, dict) and ("applied" in j or j.get("ok") is True):
-                return jsonify({"ok": True, "used": tag, "resp": j})
-        except Exception as e:
-            attempts.append({"variant": tag, "error": str(e)})
-
-    return jsonify({"ok": False, "attempts": attempts}), 502
-
-@app.route("/advisor/set", methods=["POST"])
-def advisor_set():
-    global ADVISOR_FAIL_MODE, ADVISOR_MANUAL_OVERRIDE
-    global ADVISOR_ALLOW_SOURCES, ADVISOR_BLOCK_SOURCES
-    global ADVISOR_ENABLED, ADVISOR_URL, ADVISOR_SECRET
-
-    data = request.get_json(force=True, silent=True) or {}
-
-    # Basis toggle/config
-    if "enabled" in data:
-        ADVISOR_ENABLED = bool(data["enabled"])
-    if "url" in data:
-        ADVISOR_URL = str(data["url"]).strip()
-    if "secret" in data:
-        ADVISOR_SECRET = str(data["secret"]).strip()
-    if data.get("fail_mode") in ("open", "closed"):
-        ADVISOR_FAIL_MODE = data["fail_mode"]
-
-    # Allow/Block lijsten
-    if "allow_sources" in data:
-        ADVISOR_ALLOW_SOURCES = set(str(s).lower() for s in (data.get("allow_sources") or []))
-    if "block_sources" in data:
-        ADVISOR_BLOCK_SOURCES = set(str(s).lower() for s in (data.get("block_sources") or []))
-
-    # Tijdelijke manual override: {"override":{"mode":"allow"|"block","seconds":600,"reason":"..."}}
-    if isinstance(data.get("override"), dict):
-        ov = data["override"]
-        mode = ov.get("mode", "allow")
-        if mode in ("allow", "block"):
-            secs = int(ov.get("seconds", 0))
-            if secs > 0:
-                ADVISOR_MANUAL_OVERRIDE = {
-                    "mode": mode,
-                    "until": time.time() + secs,
-                    "reason": str(ov.get("reason", ""))
-                }
-            else:
-                ADVISOR_MANUAL_OVERRIDE = None
-
-    return advisor_status()
-
-def idle_worker():
-    # plek voor periodieke taken (bijv. future trailing/pings)
-    while True:
-        time.sleep(60)
-
+# Config + Advisor view
 @app.route("/config", methods=["GET"])
 def config_view():
-    def masked(s): 
-        return bool(s)  # geen secrets tonen; alleen aangeven of iets gezet is
-
-    advisor_effective = advisor_fetch_effective(SYMBOL_STR) if (ADVISOR_ENABLED and ADVISOR_URL) else None
-
+    def masked(s): return bool(s)
     return jsonify({
         "symbol": SYMBOL_STR,
         "timeframe_default": "1m",
         "live_mode": LIVE_MODE,
         "start_capital": START_CAPITAL,
         "sparen_start": SPAREN_START,
-        "savings_split": SAVINGS_SPLIT,          # 1.0 = 100% winst naar spaar
+        "savings_split": SAVINGS_SPLIT,
         "cooldown_s": MIN_TRADE_COOLDOWN_S,
         "dedup_window_s": DEDUP_WINDOW_S,
         "use_trend_filter": USE_TREND_FILTER,
         "advisor_enabled": ADVISOR_ENABLED,
-        "advisor_url_set": bool(ADVISOR_URL),
+        "advisor_url": ADVISOR_URL,
         "advisor_secret_set": masked(ADVISOR_SECRET),
-        "webhook_secret_set": masked(WEBHOOK_SECRET),
         "telegram_config_ok": bool(TG_TOKEN and TG_CHAT_ID),
         "trades_file": TRADES_FILE,
-        # runtime state
+        # runtime
         "in_position": in_position,
         "entry_price": round(entry_price, 4),
         "capital": round(capital, 2),
         "sparen": round(sparen, 2),
         "totaalwaarde": round(capital + sparen, 2),
         "last_action": datetime.fromtimestamp(last_action_ts).strftime("%d-%m-%Y %H:%M:%S") if last_action_ts > 0 else None,
-        # nieuw: toon wat de Advisor nu hanteert (zoals je in Postman zag: {"applied": {...}})
-        "advisor_effective": advisor_effective
+        # advisor (lokaal applied)
+        "advisor_applied": _advisor_applied(SYMBOL_STR),
     })
 
 
+def idle_worker():
+    # plek voor periodieke taken (bijv. future trailing/pings)
+    while True:
+        time.sleep(60)
+
+
 if __name__ == "__main__":
-    load_trades()  # probeer bestaande log in te lezen bij start
+    _advisor_load()  # laad persistente advisor-config
+    load_trades()    # probeer bestaande log in te lezen bij start
     port = int(os.environ.get("PORT", "5000"))
     print(f"✅ Webhook server op http://0.0.0.0:{port}/webhook")
     Thread(target=idle_worker, daemon=True).start()
