@@ -54,6 +54,11 @@ if not TG_TOKEN or not TG_CHAT_ID:
 
 exchange = ccxt.binance({"enableRateLimit": True}) if USE_TREND_FILTER else None
 
+DEBUG_SIG = os.getenv("DEBUG_SIG", "1") == "1"  # tijdelijk aan
+def _dbg(msg: str):
+    if DEBUG_SIG:
+        print(f"[SIGDBG] {msg}")
+
 # --- State ---
 in_position = False
 entry_price = 0.0
@@ -437,7 +442,7 @@ def health():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global in_position, entry_price, capital, sparen, last_action_ts
+    global in_position, entry_price, capital, sparen, last_action_ts, entry_ts
 
     # Secret check
     if WEBHOOK_SECRET:
@@ -457,37 +462,44 @@ def webhook():
     if price <= 0 or action not in ("buy", "sell"):
         return "Bad payload", 400
 
+    # ---- DEBUG: binnenkomend signaal
+    _dbg(f"incoming action={action} price={price} src={source} tf={tf}")
+
     # De-dup & cooldown
     if is_duplicate_signal(action, source, price, tf):
-        print("[DEDUP] ignored", action, source, price, tf)
+        _dbg(f"dedup ignored key={(action, source, round(price,4), tf)} win={DEDUP_WINDOW_S}s")
         return "OK", 200
     if blocked_by_cooldown():
-        print("[COOLDOWN] ignored")
+        _dbg(f"cooldown ignored min={MIN_TRADE_COOLDOWN_S}s since last_action")
         return "OK", 200
 
     # Advisor check
     allowed, advisor_reason = advisor_allows(action, price, source, tf)
+    _dbg(f"advisor {('ALLOW' if allowed else 'BLOCK')} reason={advisor_reason}")
     if not allowed:
-        print(f"[ADVISOR] blocked: {advisor_reason}")
         return "OK", 200
 
     timestamp = now_str()
 
     # === BUY ===
-    if action == "buy" and not in_position:
+    if action == "buy":
+        if in_position:
+            _dbg(f"buy ignored: already in_position at entry={entry_price}")
+            return "OK", 200
+
         ok, ma200 = trend_ok(price)
+        _dbg(f"trend_ok={ok} ma200={ma200:.6f} price={price:.6f}")
         if not ok:
-            print(f"[TREND] Blocked BUY: price {price:.4f} < MA200 {ma200:.4f}")
+            _dbg("blocked by MA200 filter")
             return "OK", 200
 
         entry_price = price
         in_position = True
         last_action_ts = time.time()
-        global entry_ts
         entry_ts = time.time()
 
         send_tg(
-    f"""🟢 <b>[XRP/USDT] AANKOOP</b>
+            f"""🟢 <b>[XRP/USDT] AANKOOP</b>
 📹 Koopprijs: ${price:.4f}
 🧠 Signaalbron: {source} | {advisor_reason}
 🕒 TF: {tf}
@@ -496,13 +508,18 @@ def webhook():
 📈 Totale waarde: €{capital + sparen:.2f}
 🔐 Tradebedrag: €{START_CAPITAL:.2f}
 🔗 Tijd: {timestamp}"""
-)
+        )
 
+        # log (winst = 0 bij buy)
         log_trade("buy", price, 0.0, source, tf)
         return "OK", 200
 
     # === SELL ===
-    if action == "sell" and in_position:
+    if action == "sell":
+        if not in_position:
+            _dbg("sell ignored: flat (not in_position)")
+            return "OK", 200
+
         if entry_price <= 0:
             return "No valid entry", 400
 
@@ -527,18 +544,19 @@ def webhook():
 
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
         send_tg(
-    f"""📄 <b>[XRP/USDT] VERKOOP</b>
+            f"""📄 <b>[XRP/USDT] VERKOOP</b>
 📹 Verkoopprijs: ${price:.4f}
 🧠 Signaalbron: {source} | {advisor_reason}
 🕒 TF: {tf}
 💰 Handelssaldo: €{capital:.2f}
 💼 Spaarrekening: €{sparen:.2f}
-📈 {"Winst" if winst_bedrag >= 0 else "Verlies"}: €{winst_bedrag:.2f}
+📈 {resultaat}: €{winst_bedrag:.2f}
 📈 Totale waarde: €{capital + sparen:.2f}
 🔐 Tradebedrag: €{START_CAPITAL:.2f}
 🔗 Tijd: {timestamp}"""
-)
+        )
 
+        # log (winst/verlies vastleggen)
         log_trade("sell", price, winst_bedrag, source, tf)
         entry_price = 0.0
         return "OK", 200
@@ -617,16 +635,15 @@ def config_view():
         "advisor_applied": _advisor_applied(SYMBOL_STR),
     })
 
-
 def idle_worker():
     while True:
         time.sleep(PRICE_POLL_S)
         try:
-         last, src = fetch_last_price_any(SYMBOL_TV)
+            # watchdog voor hard SL / max-hold
+            forced_exit_check()
         except Exception as e:
-         print(f"[PRICE] fetch fail all: {e}")
-         return
-
+            print(f"[WATCHDOG] error: {e}")
+            # NIET returnen; gewoon door blijven lopen
 
 if __name__ == "__main__":
     _advisor_load()  # laad persistente advisor-config
