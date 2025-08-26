@@ -290,7 +290,6 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
     in_position = False
     last_action_ts = time.time()
 
-    resultaat = "Winst" of "Verlies"
     resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
     timestamp = now_str()
     send_tg(
