@@ -18,6 +18,12 @@ SYMBOL_STR = "XRPUSDT"         # voor advisor/logs
 START_CAPITAL = float(os.getenv("START_CAPITAL", "500"))
 SPAREN_START  = float(os.getenv("SPAREN_START",  "500"))
 LIVE_MODE     = os.getenv("LIVE_MODE", "1") == "1"
+# --- Local safety net ---
+HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8%
+MAX_HOLD_MIN  = int(os.getenv("MAX_HOLD_MIN", "45"))      # force exit na 45 min
+PRICE_POLL_S  = int(os.getenv("PRICE_POLL_S", "5"))       # elke 5s prijs checken
+
+entry_ts = 0.0  # timestamp van laatste BUY (voor hold-timer)
 
 # 100% van winst naar spaar (instelbaar)
 SAVINGS_SPLIT = float(os.getenv("SAVINGS_SPLIT", "1.0"))
@@ -237,6 +243,83 @@ def log_trade(action: str, price: float, winst: float, source: str, tf: str):
     if len(trade_log) > 2000:
         trade_log[:] = trade_log[-2000:]
     save_trades()
+    
+# --- Safety / Forced-Exit helpers ---
+HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8% hard stop
+MAX_HOLD_MIN  = int(os.getenv("MAX_HOLD_MIN", "45"))      # max 45 min positie
+PRICE_POLL_S  = int(os.getenv("PRICE_POLL_S", "5"))       # elke 5s check
+entry_ts      = 0.0                                       # wordt gezet bij BUY
+
+def _get_spot_price() -> float | None:
+    """Haal actuele spotprijs op; val stil terug bij fout."""
+    try:
+        if exchange is not None:
+            t = exchange.fetch_ticker(SYMBOL_TV)
+            return float(t["last"])
+    except Exception as e:
+        print(f"[PRICE] fetch fail: {e}")
+    return None
+
+def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
+    """Voer een SELL uit met exact dezelfde boekhouding/logica als in je webhook."""
+    global in_position, entry_price, capital, sparen, last_action_ts
+
+    if not in_position or entry_price <= 0:
+        return False
+
+    verkoop_bedrag = price * START_CAPITAL / entry_price
+    winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
+
+    if winst_bedrag > 0:
+        sparen  += SAVINGS_SPLIT * winst_bedrag
+        capital += (1.0 - SAVINGS_SPLIT) * winst_bedrag
+    else:
+        capital += winst_bedrag  # verlies ten laste van trading-kapitaal
+
+    # top-up terug naar START_CAPITAL
+    if capital < START_CAPITAL:
+        tekort = START_CAPITAL - capital
+        if sparen >= tekort:
+            sparen -= tekort
+            capital += tekort
+
+    in_position = False
+    last_action_ts = time.time()
+
+    resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
+    timestamp = now_str()
+    send_tg(
+        "🚨 <b>[XRP/USDT] FORCED SELL</b>\n"
+        f"📹 Verkoopprijs: ${price:.4f}\n"
+        f"🧠 Reden: {reason}\n"
+        f"🕒 TF: {tf}\n"
+        f"💰 Handelssaldo: €{capital:.2f}\n"
+        f"💼 Spaarrekening: €{sparen:.2f}\n"
+        f"📈 {resultaat}: €{winst_bedrag:.2f}\n"
+        f"📈 Totale waarde: €{capital + sparen:.2f}\n"
+        f"🔐 Tradebedrag: €{START_CAPITAL:.2f}\n"
+        f"🔗 Tijd: {timestamp}"
+    )
+
+    log_trade("sell", price, winst_bedrag, source, tf)
+    return True
+
+def forced_exit_check():
+    """Check hard SL en max-hold. Roept _do_forced_sell aan indien nodig."""
+    if not in_position or entry_price <= 0:
+        return
+    px = _get_spot_price()
+    if px is None:
+        return
+
+    # Hard stop-loss (absolute guardrail, los van Advisor/strategy)
+    if HARD_SL_PCT > 0 and px <= entry_price * (1.0 - HARD_SL_PCT):
+        _do_forced_sell(px, f"hard_sl_{HARD_SL_PCT:.3%}")
+        return
+
+    # Max hold tijd
+    if MAX_HOLD_MIN > 0 and entry_ts > 0 and (time.time() - entry_ts) >= MAX_HOLD_MIN * 60:
+        _do_forced_sell(px, f"max_hold_{MAX_HOLD_MIN}m")
 
 # --- Flask ---
 app = Flask(__name__)
@@ -352,6 +435,8 @@ def webhook():
         entry_price = price
         in_position = True
         last_action_ts = time.time()
+        global entry_ts
+        entry_ts = time.time()
 
         send_tg(
     f"""🟢 <b>[XRP/USDT] AANKOOP</b>
@@ -486,9 +571,12 @@ def config_view():
 
 
 def idle_worker():
-    # plek voor periodieke taken (bijv. future trailing/pings)
     while True:
-        time.sleep(60)
+        time.sleep(PRICE_POLL_S)
+        try:
+            forced_exit_check()
+        except Exception as e:
+            print(f"[WATCHDOG] error: {e}")
 
 
 if __name__ == "__main__":
