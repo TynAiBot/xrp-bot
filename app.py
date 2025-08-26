@@ -22,7 +22,8 @@ LIVE_MODE     = os.getenv("LIVE_MODE", "1") == "1"
 HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8%
 MAX_HOLD_MIN  = int(os.getenv("MAX_HOLD_MIN", "45"))      # force exit na 45 min
 PRICE_POLL_S  = int(os.getenv("PRICE_POLL_S", "5"))       # elke 5s prijs checken
-
+# Data-bron voor koers/klines: 'auto' (binance→bybit→okx), of forceer 'binance' | 'bybit' | 'okx'
+EXCHANGE_SOURCE = os.getenv("EXCHANGE_SOURCE", "auto").lower()  # auto
 entry_ts = 0.0  # timestamp van laatste BUY (voor hold-timer)
 
 # 100% van winst naar spaar (instelbaar)
@@ -180,17 +181,17 @@ def advisor_allows(action: str, price: float, source: str, tf: str) -> (bool, st
         print(f"[ADVISOR] unreachable: {e}")
         return True, "advisor_unreachable"
 
-def trend_ok(price: float) -> (bool, float):
+def trend_ok(price: float) -> Tuple[bool, float]:
     """MA200: koop alleen boven MA200 (1m). Bij fout niet blokkeren."""
-    if not USE_TREND_FILTER or exchange is None:
+    if not USE_TREND_FILTER:
         return True, float("nan")
     try:
-        ohlcv = exchange.fetch_ohlcv(SYMBOL_TV, timeframe="1m", limit=210)
+        ohlcv, src = fetch_ohlcv_any(SYMBOL_TV, timeframe="1m", limit=210)
         closes = [c[4] for c in ohlcv]
         ma200 = sum(closes[-200:]) / 200.0
         return price > ma200, ma200
     except Exception as e:
-        print(f"[TREND] fetch fail: {e}")
+        print(f"[TREND] fetch fail all: {e}")
         return True, float("nan")
 
 def blocked_by_cooldown() -> bool:
@@ -308,18 +309,64 @@ def forced_exit_check():
     """Check hard SL en max-hold. Roept _do_forced_sell aan indien nodig."""
     if not in_position or entry_price <= 0:
         return
-    px = _get_spot_price()
-    if px is None:
+
+    # Haal prijs met fallbacks en toon via welke bron
+    try:
+        last, src = fetch_last_price_any(SYMBOL_TV)
+        print(f"[PRICE] via {src}: {last}")
+    except Exception as e:
+        print(f"[PRICE] fetch fail all: {e}")
         return
 
     # Hard stop-loss (absolute guardrail, los van Advisor/strategy)
-    if HARD_SL_PCT > 0 and px <= entry_price * (1.0 - HARD_SL_PCT):
-        _do_forced_sell(px, f"hard_sl_{HARD_SL_PCT:.3%}")
+    if HARD_SL_PCT > 0 and last <= entry_price * (1.0 - HARD_SL_PCT):
+        _do_forced_sell(last, f"hard_sl_{HARD_SL_PCT:.3%}")
         return
 
     # Max hold tijd
     if MAX_HOLD_MIN > 0 and entry_ts > 0 and (time.time() - entry_ts) >= MAX_HOLD_MIN * 60:
-        _do_forced_sell(px, f"max_hold_{MAX_HOLD_MIN}m")
+        _do_forced_sell(last, f"max_hold_{MAX_HOLD_MIN}m")
+        
+# ------- Multi-exchange fallbacks (klines/price) -------
+def _make_client(name: str):
+    if name == "binance":
+        return ccxt.binance({"enableRateLimit": True})
+    if name == "bybit":
+        # spot voor XRP/USDT
+        return ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+    if name == "okx":
+        return ccxt.okx({"enableRateLimit": True})
+    raise ValueError(f"unknown exchange: {name}")
+
+def _sources_order():
+    if EXCHANGE_SOURCE == "auto":
+        return ["binance", "bybit", "okx"]
+    return [EXCHANGE_SOURCE]
+
+def fetch_ohlcv_any(symbol_tv="XRP/USDT", timeframe="1m", limit=210):
+    errs = []
+    for name in _sources_order():
+        try:
+            ex = _make_client(name)
+            data = ex.fetch_ohlcv(symbol_tv, timeframe=timeframe, limit=limit)
+            return data, name
+        except Exception as e:
+            errs.append(f"{name}: {e}")
+    raise Exception(" | ".join(errs))
+
+def fetch_last_price_any(symbol_tv="XRP/USDT"):
+    errs = []
+    for name in _sources_order():
+        try:
+            ex = _make_client(name)
+            t = ex.fetch_ticker(symbol_tv)
+            last = float(t.get("last") or t.get("close") or t.get("info", {}).get("lastPrice") or 0.0)
+            if last > 0:
+                return last, name
+            raise Exception("no last price")
+        except Exception as e:
+            errs.append(f"{name}: {e}")
+    raise Exception(" | ".join(errs))
 
 # --- Flask ---
 app = Flask(__name__)
@@ -574,9 +621,10 @@ def idle_worker():
     while True:
         time.sleep(PRICE_POLL_S)
         try:
-            forced_exit_check()
+         last, src = fetch_last_price_any(SYMBOL_TV)
         except Exception as e:
-            print(f"[WATCHDOG] error: {e}")
+         print(f"[PRICE] fetch fail all: {e}")
+         return
 
 
 if __name__ == "__main__":
