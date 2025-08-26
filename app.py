@@ -9,6 +9,7 @@ import requests
 import ccxt
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from typing import Tuple
 
 load_dotenv()
 
