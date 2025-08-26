@@ -196,7 +196,8 @@ def advisor_allows(action: str, price: float, source: str, tf: str) -> (bool, st
         return True, "advisor_unreachable"
     
 def ema_series(vals, n: int):
-    if not vals: return []
+    if not vals:
+        return []
     k = 2.0 / (n + 1.0)
     e = []
     for i, v in enumerate(vals):
@@ -207,13 +208,14 @@ def ema_series(vals, n: int):
     return e
 
 def sma_at(vals, n: int, end_idx: int = None):
-    # gemiddelde over de laatste n waarden eindigend op end_idx (inclusief)
     if end_idx is None:
         end_idx = len(vals) - 1
     start = end_idx - n + 1
-    if start < 0: return None
+    if start < 0:
+        return None
     window = vals[start:end_idx + 1]
-    if len(window) < n: return None
+    if len(window) < n:
+        return None
     return sum(window) / n
 
 from typing import Tuple
@@ -222,14 +224,15 @@ def trend_ok(price: float) -> Tuple[bool, float]:
     """
     Trendfilter:
       - MA type/len/timeframe instelbaar via ENV
-      - Slope-eis: MA(now) > MA(lookback) om vlakke markten te mijden
-      - Bij fetch-fout: niet blokkeren (return True, NaN)
+      - Slope-eis: MA(now) > MA(lookback)
+      - Bij fetch-fout: niet blokkeren (True, NaN)
     """
     if not USE_TREND_FILTER:
         return True, float("nan")
 
     try:
-        ohlcv, src = fetch_ohlcv_any(SYMBOL_TV, timeframe=TREND_TF, limit=max(210, TREND_MA_LEN + TREND_SLOPE_LOOKBACK + 5))
+        need = max(210, TREND_MA_LEN + TREND_SLOPE_LOOKBACK + 5)
+        ohlcv, src = fetch_ohlcv_any(SYMBOL_TV, timeframe=TREND_TF, limit=need)
         closes = [float(c[4]) for c in ohlcv]
         if len(closes) < TREND_MA_LEN + TREND_SLOPE_LOOKBACK + 1:
             return True, float("nan")  # te weinig data → niet blokkeren
@@ -244,10 +247,7 @@ def trend_ok(price: float) -> Tuple[bool, float]:
             if ma_now is None or ma_prev is None:
                 return True, float("nan")
 
-        # Filterregels:
-        # 1) Alleen long als prijs boven MA
         price_above = price > ma_now
-        # 2) Slope omhoog (nu > lookback)
         slope_up    = ma_now > ma_prev
 
         allow = price_above and slope_up
