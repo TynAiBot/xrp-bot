@@ -461,6 +461,9 @@ def webhook():
         if request.headers.get("X-Webhook-Secret", "") != WEBHOOK_SECRET:
             return "Unauthorized", 401
 
+    # DEBUG: ruwe binnenkomst
+    _dbg(f"/webhook hit ct={request.headers.get('Content-Type')} raw={request.data[:200]!r}")
+
     data = request.get_json(force=True, silent=True) or {}
     action = str(data.get("action", "")).lower().strip()
     source = str(data.get("source", "onbekend")).lower().strip()
@@ -469,9 +472,11 @@ def webhook():
     try:
         price = float(data.get("price", 0))
     except Exception:
+        _dbg("bad price in payload")
         return "Bad price", 400
 
     if price <= 0 or action not in ("buy", "sell"):
+        _dbg("bad payload guard (price<=0 of action niet buy/sell)")
         return "Bad payload", 400
 
     # ---- DEBUG: binnenkomend signaal
@@ -510,6 +515,8 @@ def webhook():
         last_action_ts = time.time()
         entry_ts = time.time()
 
+        _dbg(f"BUY executed: entry={entry_price}")
+
         send_tg(
             f"""🟢 <b>[XRP/USDT] AANKOOP</b>
 📹 Koopprijs: ${price:.4f}
@@ -529,14 +536,15 @@ def webhook():
     # === SELL ===
     if action == "sell":
         if not in_position:
-            _dbg("sell ignored: flat (not in_position)")
+            _dbg("sell ignored: not in_position")
             return "OK", 200
-
         if entry_price <= 0:
+            _dbg("sell guard: invalid entry_price")
             return "No valid entry", 400
 
         verkoop_bedrag = price * START_CAPITAL / entry_price
         winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
+        _dbg(f"SELL calc -> price={price} entry={entry_price} pnl={winst_bedrag}")
 
         if winst_bedrag > 0:
             sparen  += SAVINGS_SPLIT * winst_bedrag
@@ -555,6 +563,9 @@ def webhook():
         last_action_ts = time.time()
 
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
+
+        _dbg(f"SELL executed -> {resultaat}={winst_bedrag}, capital={capital}, sparen={sparen}")
+
         send_tg(
             f"""📄 <b>[XRP/USDT] VERKOOP</b>
 📹 Verkoopprijs: ${price:.4f}
@@ -573,6 +584,8 @@ def webhook():
         entry_price = 0.0
         return "OK", 200
 
+    # Fallback
+    _dbg("unknown path fallthrough (should not happen)")
     return "OK", 200
 
 # --- Rapportage ---
