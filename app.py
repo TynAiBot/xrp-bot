@@ -55,9 +55,16 @@ if not TG_TOKEN or not TG_CHAT_ID:
 exchange = ccxt.binance({"enableRateLimit": True}) if USE_TREND_FILTER else None
 
 DEBUG_SIG = os.getenv("DEBUG_SIG", "1") == "1"  # tijdelijk aan
+
 def _dbg(msg: str):
     if DEBUG_SIG:
         print(f"[SIGDBG] {msg}")
+DEBUG_SIG = os.getenv("DEBUG_SIG", "1") == "1"  # tijdelijk aan
+def _dbg(msg: str):
+    if DEBUG_SIG:
+        print(f"[SIGDBG] {msg}")
+
+_dbg("booted")  # <-- voeg deze regel toe
 
 # --- State ---
 in_position = False
@@ -435,6 +442,11 @@ def advisor_admin_set():
 def advisor_admin_tweak():
     return advisor_admin_set()
 
+@app.route("/debug/ping", methods=["GET"])
+def debug_ping():
+    _dbg("ping from /debug/ping")
+    print("[DIRECT] debug ping hit")
+    return jsonify({"ok": True, "debug_sig": DEBUG_SIG}), 200
 
 @app.route("/health")
 def health():
