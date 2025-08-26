@@ -19,8 +19,9 @@ SYMBOL_STR = "XRPUSDT"         # voor advisor/logs
 START_CAPITAL = float(os.getenv("START_CAPITAL", "500"))
 SPAREN_START  = float(os.getenv("SPAREN_START",  "500"))
 LIVE_MODE     = os.getenv("LIVE_MODE", "1") == "1"
-# --- Local safety net ---
-HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8%
+
+# --- Local safety net (guardrails) ---
+HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8% hard stop
 MAX_HOLD_MIN  = int(os.getenv("MAX_HOLD_MIN", "45"))      # force exit na 45 min
 PRICE_POLL_S  = int(os.getenv("PRICE_POLL_S", "5"))       # elke 5s prijs checken
 # Data-bron voor koers/klines: 'auto' (binance→bybit→okx), of forceer 'binance' | 'bybit' | 'okx'
@@ -54,9 +55,8 @@ if not TG_TOKEN or not TG_CHAT_ID:
 
 exchange = ccxt.binance({"enableRateLimit": True}) if USE_TREND_FILTER else None
 
-# Debug helper (zet DEBUG_SIG=1 in Render > Environment)
+# Debug helper (zet DEBUG_SIG=1 in Render > Environment; zet ook PYTHONUNBUFFERED=1)
 DEBUG_SIG = os.getenv("DEBUG_SIG", "1") == "1"
-
 def _dbg(msg: str):
     if DEBUG_SIG:
         print(f"[SIGDBG] {msg}", flush=True)
@@ -115,7 +115,7 @@ def _advisor_save():
             json.dump(ADVISOR_STATE, f, ensure_ascii=False, indent=2)
         os.replace(tmp, ADVISOR_STORE)
     except Exception as e:
-        print("[ADVISOR_STORE] save error:", e)
+        print("[ADVISOR_STORE] save error:", e, flush=True)
 
 def _advisor_applied(symbol: str) -> dict:
     s = (symbol or "").upper().strip() or SYMBOL_STR
@@ -166,9 +166,9 @@ def send_tg(text_html: str):
             timeout=6,
         )
         if r.status_code != 200:
-            print(f"[TG] {r.status_code} {r.text[:200]}")
+            print(f"[TG] {r.status_code} {r.text[:200]}", flush=True)
     except Exception as e:
-        print(f"[TG ERROR] {e}")
+        print(f"[TG ERROR] {e}", flush=True)
 
 def advisor_allows(action: str, price: float, source: str, tf: str) -> (bool, str):
     """Vraag Advisor (lokale /advisor of externe). Fallback = toestaan."""
@@ -188,7 +188,7 @@ def advisor_allows(action: str, price: float, source: str, tf: str) -> (bool, st
         reason = str(j.get("reason", f"status_{r.status_code}"))
         return allow, reason
     except Exception as e:
-        print(f"[ADVISOR] unreachable: {e}")
+        print(f"[ADVISOR] unreachable: {e}", flush=True)
         return True, "advisor_unreachable"
 
 def trend_ok(price: float) -> Tuple[bool, float]:
@@ -201,7 +201,7 @@ def trend_ok(price: float) -> Tuple[bool, float]:
         ma200 = sum(closes[-200:]) / 200.0
         return price > ma200, ma200
     except Exception as e:
-        print(f"[TREND] fetch fail all: {e}")
+        print(f"[TREND] fetch fail all: {e}", flush=True)
         return True, float("nan")
 
 def blocked_by_cooldown() -> bool:
@@ -224,21 +224,19 @@ def load_trades():
                 trade_log = json.load(f)
                 if not isinstance(trade_log, list):
                     trade_log = []
-            print(f"[LOG] geladen: {len(trade_log)} trades uit {TRADES_FILE}")
+            print(f"[LOG] geladen: {len(trade_log)} trades uit {TRADES_FILE}", flush=True)
         else:
             trade_log = []
     except Exception as e:
-        print(f"[LOG] load error: {e}")
+        print(f"[LOG] load error: {e}", flush=True)
         trade_log = []
-
 
 def save_trades():
     try:
         with open(TRADES_FILE, "w", encoding="utf-8") as f:
             json.dump(trade_log, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[LOG] save error: {e}")
-
+        print(f"[LOG] save error: {e}", flush=True)
 
 def log_trade(action: str, price: float, winst: float, source: str, tf: str):
     trade_log.append({
@@ -254,13 +252,8 @@ def log_trade(action: str, price: float, winst: float, source: str, tf: str):
     if len(trade_log) > 2000:
         trade_log[:] = trade_log[-2000:]
     save_trades()
-    
-# --- Safety / Forced-Exit helpers ---
-HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8% hard stop
-MAX_HOLD_MIN  = int(os.getenv("MAX_HOLD_MIN", "45"))      # max 45 min positie
-PRICE_POLL_S  = int(os.getenv("PRICE_POLL_S", "5"))       # elke 5s check
-entry_ts      = 0.0                                       # wordt gezet bij BUY
 
+# --- Safety / Forced-Exit helpers ---
 def _get_spot_price() -> float | None:
     """Haal actuele spotprijs op; val stil terug bij fout."""
     try:
@@ -268,7 +261,7 @@ def _get_spot_price() -> float | None:
             t = exchange.fetch_ticker(SYMBOL_TV)
             return float(t["last"])
     except Exception as e:
-        print(f"[PRICE] fetch fail: {e}")
+        print(f"[PRICE] fetch fail: {e}", flush=True)
     return None
 
 def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
@@ -297,6 +290,7 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
     in_position = False
     last_action_ts = time.time()
 
+    resultaat = "Winst" of "Verlies"
     resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
     timestamp = now_str()
     send_tg(
@@ -323,9 +317,9 @@ def forced_exit_check():
     # Haal prijs met fallbacks en toon via welke bron
     try:
         last, src = fetch_last_price_any(SYMBOL_TV)
-        print(f"[PRICE] via {src}: {last}")
+        print(f"[PRICE] via {src}: {last}", flush=True)
     except Exception as e:
-        print(f"[PRICE] fetch fail all: {e}")
+        print(f"[PRICE] fetch fail all: {e}", flush=True)
         return
 
     # Hard stop-loss (absolute guardrail, los van Advisor/strategy)
@@ -336,7 +330,7 @@ def forced_exit_check():
     # Max hold tijd
     if MAX_HOLD_MIN > 0 and entry_ts > 0 and (time.time() - entry_ts) >= MAX_HOLD_MIN * 60:
         _do_forced_sell(last, f"max_hold_{MAX_HOLD_MIN}m")
-        
+
 # ------- Multi-exchange fallbacks (klines/price) -------
 def _make_client(name: str):
     if name == "binance":
@@ -409,7 +403,6 @@ def advisor_endpoint():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
 
-
 @app.route("/advisor/admin/get", methods=["POST"])
 def advisor_admin_get():
     if not _advisor_auth_ok(request):
@@ -417,7 +410,6 @@ def advisor_admin_get():
     data = request.get_json(force=True, silent=True) or {}
     sym = data.get("symbol", SYMBOL_STR)
     return jsonify({"ok": True, "applied": _advisor_applied(sym)})
-
 
 @app.route("/advisor/admin/set", methods=["POST"])
 def advisor_admin_set():
@@ -433,7 +425,6 @@ def advisor_admin_set():
     ADVISOR_STATE["updated"] = ADVISOR_STATE["symbols"][sym]["ts"]
     _advisor_save()
     return jsonify({"ok": True, "applied": ap})
-
 
 @app.route("/advisor/tweak", methods=["POST"])  # alias
 def advisor_admin_tweak():
@@ -560,7 +551,6 @@ def webhook():
         last_action_ts = time.time()
 
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
-
         _dbg(f"SELL executed -> {resultaat}={winst_bedrag}, capital={capital}, sparen={sparen}")
 
         send_tg(
@@ -622,7 +612,7 @@ def report_weekly():
     })
 
 # Optioneel: handmatig opslaan/forceren
-@app.route("/report/save", methods=["POST"]) 
+@app.route("/report/save", methods=["POST"])
 def report_save():
     save_trades()
     return jsonify({"saved": True, "file": TRADES_FILE, "count": len(trade_log)})
@@ -663,8 +653,7 @@ def idle_worker():
         try:
             forced_exit_check()
         except Exception as e:
-            print(f"[IDLE] error: {e}")
-            # niet returnen; gewoon doorgaan
+            print(f"[IDLE] error: {e}", flush=True)
             continue
 
 if __name__ == "__main__":
