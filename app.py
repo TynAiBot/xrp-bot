@@ -37,6 +37,10 @@ DEDUP_WINDOW_S       = int(os.getenv("DEDUP_WINDOW_S",       "30"))  # dezelfde 
 
 # Trendfilter
 USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"         # MA200 only-long op BUY
+TREND_TF            = os.getenv("TREND_TF", "1m")
+TREND_MA_TYPE       = os.getenv("TREND_MA_TYPE", "EMA").upper()   # 'EMA' of 'SMA'
+TREND_MA_LEN        = int(os.getenv("TREND_MA_LEN", "100"))
+TREND_SLOPE_LOOKBACK= int(os.getenv("TREND_SLOPE_LOOKBACK", "6"))
 
 # Advisor AAN
 ADVISOR_ENABLED = os.getenv("ADVISOR_ENABLED", "1") == "1"
@@ -190,18 +194,66 @@ def advisor_allows(action: str, price: float, source: str, tf: str) -> (bool, st
     except Exception as e:
         print(f"[ADVISOR] unreachable: {e}", flush=True)
         return True, "advisor_unreachable"
+    
+def ema_series(vals, n: int):
+    if not vals: return []
+    k = 2.0 / (n + 1.0)
+    e = []
+    for i, v in enumerate(vals):
+        if i == 0:
+            e.append(float(v))
+        else:
+            e.append(float(v) * k + e[-1] * (1.0 - k))
+    return e
+
+def sma_at(vals, n: int, end_idx: int = None):
+    # gemiddelde over de laatste n waarden eindigend op end_idx (inclusief)
+    if end_idx is None:
+        end_idx = len(vals) - 1
+    start = end_idx - n + 1
+    if start < 0: return None
+    window = vals[start:end_idx + 1]
+    if len(window) < n: return None
+    return sum(window) / n
+
+from typing import Tuple
 
 def trend_ok(price: float) -> Tuple[bool, float]:
-    """MA200: koop alleen boven MA200 (1m). Bij fout niet blokkeren."""
+    """
+    Trendfilter:
+      - MA type/len/timeframe instelbaar via ENV
+      - Slope-eis: MA(now) > MA(lookback) om vlakke markten te mijden
+      - Bij fetch-fout: niet blokkeren (return True, NaN)
+    """
     if not USE_TREND_FILTER:
         return True, float("nan")
+
     try:
-        ohlcv, src = fetch_ohlcv_any(SYMBOL_TV, timeframe="1m", limit=210)
-        closes = [c[4] for c in ohlcv]
-        ma200 = sum(closes[-200:]) / 200.0
-        return price > ma200, ma200
+        ohlcv, src = fetch_ohlcv_any(SYMBOL_TV, timeframe=TREND_TF, limit=max(210, TREND_MA_LEN + TREND_SLOPE_LOOKBACK + 5))
+        closes = [float(c[4]) for c in ohlcv]
+        if len(closes) < TREND_MA_LEN + TREND_SLOPE_LOOKBACK + 1:
+            return True, float("nan")  # te weinig data → niet blokkeren
+
+        if TREND_MA_TYPE == "EMA":
+            es = ema_series(closes, TREND_MA_LEN)
+            ma_now = es[-1]
+            ma_prev = es[-(TREND_SLOPE_LOOKBACK + 1)]
+        else:  # SMA
+            ma_now  = sma_at(closes, TREND_MA_LEN)
+            ma_prev = sma_at(closes[:-TREND_SLOPE_LOOKBACK], TREND_MA_LEN)
+            if ma_now is None or ma_prev is None:
+                return True, float("nan")
+
+        # Filterregels:
+        # 1) Alleen long als prijs boven MA
+        price_above = price > ma_now
+        # 2) Slope omhoog (nu > lookback)
+        slope_up    = ma_now > ma_prev
+
+        allow = price_above and slope_up
+        return allow, ma_now
     except Exception as e:
-        print(f"[TREND] fetch fail all: {e}", flush=True)
+        print(f"[TREND] fetch/signal fail: {e}")
         return True, float("nan")
 
 def blocked_by_cooldown() -> bool:
