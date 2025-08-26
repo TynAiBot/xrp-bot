@@ -664,11 +664,11 @@ def idle_worker():
     while True:
         time.sleep(PRICE_POLL_S)
         try:
-            # watchdog voor hard SL / max-hold
             forced_exit_check()
         except Exception as e:
-            print(f"[WATCHDOG] error: {e}")
-            # NIET returnen; gewoon door blijven lopen
+            print(f"[IDLE] error: {e}")
+            # niet returnen; gewoon doorgaan
+            continue
 
 if __name__ == "__main__":
     _advisor_load()  # laad persistente advisor-config
