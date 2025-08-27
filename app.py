@@ -544,26 +544,26 @@ def webhook():
     timestamp = now_str()
 
     # === BUY ===
-if action == "buy":
-    if in_position:
-        _dbg(f"buy ignored: already in_position at entry={entry_price}")
-        return "OK", 200
+    if action == "buy":
+        if in_position:
+            _dbg(f"buy ignored: already in_position at entry={entry_price}")
+            return "OK", 200
 
-    ok, ma = trend_ok(price)
-    _dbg(f"trend_ok={ok} ma={ma:.6f} price={price:.6f}")
-    if not ok:
-        _dbg("blocked by trend filter")
-        return "OK", 200
+        ok, ma = trend_ok(price)
+        _dbg(f"trend_ok={ok} ma={ma:.6f} price={price:.6f}")
+        if not ok:
+            _dbg("blocked by trend filter")
+            return "OK", 200
 
-    entry_price = price
-    in_position = True
-    last_action_ts = time.time()
-    entry_ts = time.time()
+        entry_price = price
+        in_position = True
+        last_action_ts = time.time()
+        entry_ts = time.time()
 
-    _dbg(f"BUY executed: entry={entry_price}")
+        _dbg(f"BUY executed: entry={entry_price}")
 
-    send_tg(
-        f"""🟢 <b>[XRP/USDT] AANKOOP</b>
+        send_tg(
+            f"""🟢 <b>[XRP/USDT] AANKOOP</b>
 📹 Koopprijs: ${price:.4f}
 🧠 Signaalbron: {source} | {advisor_reason}
 🕒 TF: {tf}
@@ -572,11 +572,11 @@ if action == "buy":
 📈 Totale waarde: €{capital + sparen:.2f}
 🔐 Tradebedrag: €{START_CAPITAL:.2f}
 🔗 Tijd: {timestamp}"""
-    )
+        )
 
-    # log (winst = 0 bij buy)
-    log_trade("buy", price, 0.0, source, tf)
-    return "OK", 200
+        # log (winst = 0 bij buy)
+        log_trade("buy", price, 0.0, source, tf)
+        return "OK", 200
 
     # === SELL ===
     if action == "sell":
@@ -608,6 +608,7 @@ if action == "buy":
         last_action_ts = time.time()
 
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
+
         _dbg(f"SELL executed -> {resultaat}={winst_bedrag}, capital={capital}, sparen={sparen}")
 
         send_tg(
