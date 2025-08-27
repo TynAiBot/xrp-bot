@@ -496,6 +496,26 @@ def debug_ping():
 @app.route("/health")
 def health():
     return "OK", 200
+# --- Cooldown & de-dup helpers (must be defined before /webhook) ---
+def blocked_by_cooldown() -> bool:
+    """Blokkeer nieuwe signalen binnen de cooldownperiode na de laatste actie."""
+    if MIN_TRADE_COOLDOWN_S <= 0:
+        return False
+    return (time.time() - last_action_ts) < MIN_TRADE_COOLDOWN_S
+
+def is_duplicate_signal(action: str, source: str, price: float, tf: str) -> bool:
+    """Filter identieke signalen binnen DEDUP_WINDOW_S op (action, source, price4, tf)."""
+    key = (
+        (action or "").lower(),
+        (source or "").lower(),
+        round(float(price), 4),
+        (tf or "").lower(),
+    )
+    ts_prev = last_signal_key_ts.get(key, 0.0)
+    if (time.time() - ts_prev) <= DEDUP_WINDOW_S:
+        return True
+    last_signal_key_ts[key] = time.time()
+    return False
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
