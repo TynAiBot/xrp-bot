@@ -37,10 +37,12 @@ DEDUP_WINDOW_S       = int(os.getenv("DEDUP_WINDOW_S",       "30"))  # dezelfde 
 
 # Trendfilter
 USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"         # MA200 only-long op BUY
-TREND_TF            = os.getenv("TREND_TF", "1m")
-TREND_MA_TYPE       = os.getenv("TREND_MA_TYPE", "EMA").upper()   # 'EMA' of 'SMA'
-TREND_MA_LEN        = int(os.getenv("TREND_MA_LEN", "100"))
-TREND_SLOPE_LOOKBACK= int(os.getenv("TREND_SLOPE_LOOKBACK", "6"))
+TREND_MODE            = os.getenv("TREND_MODE", "soft").lower()   # off|soft|hard
+TREND_MA_LEN          = int(os.getenv("TREND_MA_LEN", "50"))
+TREND_MA_TYPE         = os.getenv("TREND_MA_TYPE", "SMA").upper() # SMA|EMA
+TREND_TF              = os.getenv("TREND_TF", "1m")
+TREND_SLOPE_LOOKBACK  = int(os.getenv("TREND_SLOPE_LOOKBACK", "0"))  # 0=uit
+TREND_SOFT_TOL        = float(os.getenv("TREND_SOFT_TOL", "0.001"))  # 0.1%
 
 # Advisor AAN
 ADVISOR_ENABLED = os.getenv("ADVISOR_ENABLED", "1") == "1"
@@ -220,52 +222,52 @@ def sma_at(vals, n: int, end_idx: int = None):
 
 from typing import Tuple
 
+def _ema(values, n):
+    if len(values) < n:
+        return None
+    k = 2.0 / (n + 1.0)
+    ema = sum(values[:n]) / n
+    for v in values[n:]:
+        ema = v*k + ema*(1-k)
+    return ema
+
+from typing import Tuple
 def trend_ok(price: float) -> Tuple[bool, float]:
     """
-    Trendfilter:
-      - MA type/len/timeframe instelbaar via ENV
-      - Slope-eis: MA(now) > MA(lookback)
-      - Bij fetch-fout: niet blokkeren (True, NaN)
+    Bereken MA op TREND_TF met type/len (+ optionele slope).
+    Gate:
+      - TREND_MODE=off  -> nooit blokkeren
+      - TREND_MODE=soft -> blokkeren alleen als prijs < MA*(1 - tol)
+      - TREND_MODE=hard -> blokkeren als prijs < MA
     """
-    if not USE_TREND_FILTER:
-        return True, float("nan")
-
     try:
-        need = max(210, TREND_MA_LEN + TREND_SLOPE_LOOKBACK + 5)
-        ohlcv, src = fetch_ohlcv_any(SYMBOL_TV, timeframe=TREND_TF, limit=need)
+        n = max(5, int(TREND_MA_LEN))
+        ohlcv, src = fetch_ohlcv_any(SYMBOL_TV, timeframe=TREND_TF, limit=n + max(10, TREND_SLOPE_LOOKBACK + 5))
         closes = [float(c[4]) for c in ohlcv]
-        if len(closes) < TREND_MA_LEN + TREND_SLOPE_LOOKBACK + 1:
-            return True, float("nan")  # te weinig data → niet blokkeren
+        if len(closes) < n:
+            return True, float("nan")  # te weinig data -> niet blokkeren
 
-        if TREND_MA_TYPE == "EMA":
-            es = ema_series(closes, TREND_MA_LEN)
-            ma_now = es[-1]
-            ma_prev = es[-(TREND_SLOPE_LOOKBACK + 1)]
-        else:  # SMA
-            ma_now  = sma_at(closes, TREND_MA_LEN)
-            ma_prev = sma_at(closes[:-TREND_SLOPE_LOOKBACK], TREND_MA_LEN)
-            if ma_now is None or ma_prev is None:
-                return True, float("nan")
+        ma = _ema(closes, n) if TREND_MA_TYPE == "EMA" else sum(closes[-n:]) / float(n)
 
-        price_above = price > ma_now
-        slope_up    = ma_now > ma_prev
+        ok_gate = True
+        if USE_TREND_FILTER:
+            mode = TREND_MODE
+            if mode == "hard":
+                ok_gate = price > ma
+            elif mode == "soft":
+                ok_gate = price >= ma * (1.0 - max(0.0, TREND_SOFT_TOL))
+            else:  # off
+                ok_gate = True
 
-        allow = price_above and slope_up
-        return allow, ma_now
+            # optionele slope
+            if ok_gate and TREND_SLOPE_LOOKBACK > 0 and len(closes) > TREND_SLOPE_LOOKBACK:
+                past = closes[-(TREND_SLOPE_LOOKBACK+1)]
+                ok_gate = (closes[-1] - past) >= 0
+
+        return ok_gate, (ma if ma is not None else float("nan"))
     except Exception as e:
-        print(f"[TREND] fetch/signal fail: {e}")
+        print(f"[TREND] fetch fail: {e}")
         return True, float("nan")
-
-def blocked_by_cooldown() -> bool:
-    return (time.time() - last_action_ts) < MIN_TRADE_COOLDOWN_S if MIN_TRADE_COOLDOWN_S > 0 else False
-
-def is_duplicate_signal(action: str, source: str, price: float, tf: str) -> bool:
-    key = (action, source, round(price, 4), tf)
-    ts = last_signal_key_ts.get(key, 0.0)
-    if (time.time() - ts) <= DEDUP_WINDOW_S:
-        return True
-    last_signal_key_ts[key] = time.time()
-    return False
 
 # --- Persistente log helpers ---
 def load_trades():
@@ -468,7 +470,7 @@ def advisor_admin_set():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     data = request.get_json(force=True, silent=True) or {}
     sym = (data.get("symbol") or SYMBOL_STR).upper().strip()
-    raw = data.get("values") or data.get("changes") or {}
+    raw = data.get("values") or data.get("changes") or {k:v for k,v in data.items() if k.lower() not in {"symbol"}}
     vals = _advisor_coerce(raw)
     ap = _advisor_applied(sym)
     ap.update(vals)
@@ -476,6 +478,10 @@ def advisor_admin_set():
     ADVISOR_STATE["updated"] = ADVISOR_STATE["symbols"][sym]["ts"]
     _advisor_save()
     return jsonify({"ok": True, "applied": ap})
+
+@app.route("/advisor/set", methods=["POST"])
+def advisor_set_compat():
+    return advisor_admin_set()
 
 @app.route("/advisor/tweak", methods=["POST"])  # alias
 def advisor_admin_tweak():
@@ -538,26 +544,26 @@ def webhook():
     timestamp = now_str()
 
     # === BUY ===
-    if action == "buy":
-        if in_position:
-            _dbg(f"buy ignored: already in_position at entry={entry_price}")
-            return "OK", 200
+if action == "buy":
+    if in_position:
+        _dbg(f"buy ignored: already in_position at entry={entry_price}")
+        return "OK", 200
 
-        ok, ma200 = trend_ok(price)
-        _dbg(f"trend_ok={ok} ma200={ma200:.6f} price={price:.6f}")
-        if not ok:
-            _dbg("blocked by MA200 filter")
-            return "OK", 200
+    ok, ma = trend_ok(price)
+    _dbg(f"trend_ok={ok} ma={ma:.6f} price={price:.6f}")
+    if not ok:
+        _dbg("blocked by trend filter")
+        return "OK", 200
 
-        entry_price = price
-        in_position = True
-        last_action_ts = time.time()
-        entry_ts = time.time()
+    entry_price = price
+    in_position = True
+    last_action_ts = time.time()
+    entry_ts = time.time()
 
-        _dbg(f"BUY executed: entry={entry_price}")
+    _dbg(f"BUY executed: entry={entry_price}")
 
-        send_tg(
-            f"""🟢 <b>[XRP/USDT] AANKOOP</b>
+    send_tg(
+        f"""🟢 <b>[XRP/USDT] AANKOOP</b>
 📹 Koopprijs: ${price:.4f}
 🧠 Signaalbron: {source} | {advisor_reason}
 🕒 TF: {tf}
@@ -566,11 +572,11 @@ def webhook():
 📈 Totale waarde: €{capital + sparen:.2f}
 🔐 Tradebedrag: €{START_CAPITAL:.2f}
 🔗 Tijd: {timestamp}"""
-        )
+    )
 
-        # log (winst = 0 bij buy)
-        log_trade("buy", price, 0.0, source, tf)
-        return "OK", 200
+    # log (winst = 0 bij buy)
+    log_trade("buy", price, 0.0, source, tf)
+    return "OK", 200
 
     # === SELL ===
     if action == "sell":
