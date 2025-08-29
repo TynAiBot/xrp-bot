@@ -49,6 +49,16 @@ ADVISOR_ENABLED = os.getenv("ADVISOR_ENABLED", "1") == "1"
 ADVISOR_URL     = os.getenv("ADVISOR_URL", "")
 ADVISOR_SECRET  = os.getenv("ADVISOR_SECRET", "")
 
+# --- Lokale TPSL monitor ---
+LOCAL_TPSL_ENABLED      = os.getenv("LOCAL_TPSL_ENABLED", "1") == "1"
+SYNC_TPSL_FROM_ADVISOR  = os.getenv("SYNC_TPSL_FROM_ADVISOR", "1") == "1"
+
+LOCAL_TP_PCT     = float(os.getenv("LOCAL_TP_PCT",     "0.010"))
+LOCAL_SL_PCT     = float(os.getenv("LOCAL_SL_PCT",     "0.009"))
+LOCAL_USE_TRAIL  = os.getenv("LOCAL_USE_TRAIL", "1") == "1"
+LOCAL_TRAIL_PCT  = float(os.getenv("LOCAL_TRAIL_PCT",  "0.007"))
+LOCAL_ARM_AT_PCT = float(os.getenv("LOCAL_ARM_AT_PCT", "0.002"))
+
 # Webhook beveiliging (optioneel)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
@@ -196,6 +206,102 @@ def advisor_allows(action: str, price: float, source: str, tf: str) -> (bool, st
     except Exception as e:
         print(f"[ADVISOR] unreachable: {e}", flush=True)
         return True, "advisor_unreachable"
+    
+# TPSL per-trade state
+tpsl_state = {
+    "active": False,     # aan/uit per positie
+    "tp_pct": None,
+    "sl_pct": None,
+    "use_trail": None,
+    "trail_pct": None,
+    "arm_at_pct": None,
+    "armed": False,      # trailing geactiveerd?
+    "high": 0.0          # high-watermark sinds entry
+}
+
+def _tpsl_defaults_from_env():
+    return {
+        "tp_pct":     LOCAL_TP_PCT,
+        "sl_pct":     LOCAL_SL_PCT,
+        "use_trail":  LOCAL_USE_TRAIL,
+        "trail_pct":  LOCAL_TRAIL_PCT,
+        "arm_at_pct": LOCAL_ARM_AT_PCT,
+    }
+
+def _tpsl_from_advisor():
+    ap = _advisor_applied(SYMBOL_STR)  # gebruikt je embedded advisor state
+    return {
+        "tp_pct":     float(ap.get("TAKE_PROFIT_PCT", LOCAL_TP_PCT)),
+        "sl_pct":     float(ap.get("STOP_LOSS_PCT",   LOCAL_SL_PCT)),
+        "use_trail":  bool(ap.get("USE_TRAILING",     LOCAL_USE_TRAIL)),
+        "trail_pct":  float(ap.get("TRAIL_PCT",       LOCAL_TRAIL_PCT)),
+        "arm_at_pct": float(ap.get("ARM_AT_PCT",      LOCAL_ARM_AT_PCT)),
+    }
+
+def tpsl_reset():
+    tpsl_state.update({
+        "active": False, "tp_pct": None, "sl_pct": None,
+        "use_trail": None, "trail_pct": None, "arm_at_pct": None,
+        "armed": False, "high": 0.0
+    })
+
+def tpsl_on_buy(entry: float):
+    """Init TPSL op basis van Advisor of ENV, en activeer voor deze positie."""
+    if not LOCAL_TPSL_ENABLED:
+        tpsl_reset()
+        return
+    try:
+        params = _tpsl_from_advisor() if SYNC_TPSL_FROM_ADVISOR else _tpsl_defaults_from_env()
+    except Exception:
+        params = _tpsl_defaults_from_env()
+
+    tpsl_state.update(params)
+    tpsl_state["active"] = True
+    tpsl_state["armed"]  = False
+    tpsl_state["high"]   = entry
+    _dbg(f"TPSL armed: {params}")
+
+def local_tpsl_check(last_price: float):
+    """Controleer TP/SL/Trailing; bij trigger -> lokale SELL (forced)."""
+    if not (LOCAL_TPSL_ENABLED and in_position and tpsl_state["active"] and entry_price > 0):
+        return
+
+    e  = entry_price
+    tp = e * (1.0 + float(tpsl_state["tp_pct"] or 0.0))
+    sl = e * (1.0 - float(tpsl_state["sl_pct"] or 0.0))
+
+    # Take Profit
+    if last_price >= tp > 0:
+        _dbg(f"TPSL: TP hit @ {last_price:.6f} (tp={tp:.6f})")
+        _do_forced_sell(last_price, "local_tp")
+        tpsl_reset()
+        return
+
+    # Hard Stop
+    if last_price <= sl < e:
+        _dbg(f"TPSL: SL hit @ {last_price:.6f} (sl={sl:.6f})")
+        _do_forced_sell(last_price, "local_sl")
+        tpsl_reset()
+        return
+
+    # Trailing (optioneel)
+    if tpsl_state.get("use_trail"):
+        arm_level = e * (1.0 + float(tpsl_state["arm_at_pct"] or 0.0))
+        if not tpsl_state["armed"]:
+            if last_price >= arm_level:
+                tpsl_state["armed"] = True
+                tpsl_state["high"]  = last_price
+                _dbg(f"TPSL: trail ARMED at {last_price:.6f} (arm_level={arm_level:.6f})")
+        else:
+            # update high-watermark
+            if last_price > tpsl_state["high"]:
+                tpsl_state["high"] = last_price
+            trail_stop = tpsl_state["high"] * (1.0 - float(tpsl_state["trail_pct"] or 0.0))
+            if last_price <= trail_stop:
+                _dbg(f"TPSL: TRAIL stop @ {last_price:.6f} (trail_stop={trail_stop:.6f}, high={tpsl_state['high']:.6f})")
+                _do_forced_sell(last_price, "local_trail")
+                tpsl_reset()
+                return
     
 def ema_series(vals, n: int):
     if not vals:
@@ -362,27 +468,29 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
     log_trade("sell", price, winst_bedrag, source, tf)
     return True
 
-def forced_exit_check():
+def forced_exit_check(last_price: float | None = None):
     """Check hard SL en max-hold. Roept _do_forced_sell aan indien nodig."""
     if not in_position or entry_price <= 0:
         return
 
-    # Haal prijs met fallbacks en toon via welke bron
-    try:
-        last, src = fetch_last_price_any(SYMBOL_TV)
-        print(f"[PRICE] via {src}: {last}", flush=True)
-    except Exception as e:
-        print(f"[PRICE] fetch fail all: {e}", flush=True)
-        return
+    # Haal prijs (of gebruik aangeleverde)
+    if last_price is None:
+        try:
+            last_price, src = fetch_last_price_any(SYMBOL_TV)
+            print(f"[PRICE] via {src}: {last_price}")
+        except Exception as e:
+            print(f"[PRICE] fetch fail all: {e}")
+            return
 
-    # Hard stop-loss (absolute guardrail, los van Advisor/strategy)
-    if HARD_SL_PCT > 0 and last <= entry_price * (1.0 - HARD_SL_PCT):
-        _do_forced_sell(last, f"hard_sl_{HARD_SL_PCT:.3%}")
+    # Hard stop-loss
+    if HARD_SL_PCT > 0 and last_price <= entry_price * (1.0 - HARD_SL_PCT):
+        _do_forced_sell(last_price, f"hard_sl_{HARD_SL_PCT:.3%}")
         return
 
     # Max hold tijd
     if MAX_HOLD_MIN > 0 and entry_ts > 0 and (time.time() - entry_ts) >= MAX_HOLD_MIN * 60:
-        _do_forced_sell(last, f"max_hold_{MAX_HOLD_MIN}m")
+        _do_forced_sell(last_price, f"max_hold_{MAX_HOLD_MIN}m")
+        return
 
 # ------- Multi-exchange fallbacks (klines/price) -------
 def _make_client(name: str):
@@ -519,7 +627,7 @@ def is_duplicate_signal(action: str, source: str, price: float, tf: str) -> bool
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global in_position, entry_price, capital, sparen, last_action_ts, entry_ts
+    global in_position, entry_price, capital, sparen, last_action_ts, entry_ts, tpsl_state
 
     # Secret check
     if WEBHOOK_SECRET:
@@ -579,8 +687,20 @@ def webhook():
         in_position = True
         last_action_ts = time.time()
         entry_ts = time.time()
-
         _dbg(f"BUY executed: entry={entry_price}")
+
+        # --- (5) ARM LOKALE TPSL OP BUY ---
+        if LOCAL_TPSL_ENABLED:
+            ap = _advisor_applied(SYMBOL_STR)  # neem actuele params over
+            tpsl_state["active"]     = True
+            tpsl_state["armed"]      = False
+            tpsl_state["entry_price"]= price
+            tpsl_state["high_water"] = price
+            tpsl_state["tp_pct"]     = float(ap.get("TAKE_PROFIT_PCT", 0.012))
+            tpsl_state["sl_pct"]     = float(ap.get("STOP_LOSS_PCT",   0.018))
+            tpsl_state["trail_pct"]  = float(ap.get("TRAIL_PCT",       0.006)) if ap.get("USE_TRAILING", True) else 0.0
+            tpsl_state["arm_at_pct"] = float(ap.get("ARM_AT_PCT",      0.004))
+            _dbg(f"[TPSL] armed on BUY: {tpsl_state}")
 
         send_tg(
             f"""🟢 <b>[XRP/USDT] AANKOOP</b>
@@ -628,8 +748,15 @@ def webhook():
         last_action_ts = time.time()
 
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
-
         _dbg(f"SELL executed -> {resultaat}={winst_bedrag}, capital={capital}, sparen={sparen}")
+
+        # --- (5) RESET LOKALE TPSL NA SELL ---
+        if LOCAL_TPSL_ENABLED:
+            tpsl_state["active"]      = False
+            tpsl_state["armed"]       = False
+            tpsl_state["entry_price"] = 0.0
+            tpsl_state["high_water"]  = 0.0
+            _dbg("[TPSL] reset on SELL")
 
         send_tg(
             f"""📄 <b>[XRP/USDT] VERKOOP</b>
@@ -698,8 +825,15 @@ def report_save():
 # Config + Advisor view
 @app.route("/config", methods=["GET"])
 def config_view():
-    def masked(s): return bool(s)
-    return jsonify({
+    def masked(s): 
+        return bool(s)
+
+    last_action_str = (
+        datetime.fromtimestamp(last_action_ts).strftime("%d-%m-%Y %H:%M:%S")
+        if last_action_ts > 0 else None
+    )
+
+    payload = {
         "symbol": SYMBOL_STR,
         "timeframe_default": "1m",
         "live_mode": LIVE_MODE,
@@ -714,24 +848,43 @@ def config_view():
         "advisor_secret_set": masked(ADVISOR_SECRET),
         "telegram_config_ok": bool(TG_TOKEN and TG_CHAT_ID),
         "trades_file": TRADES_FILE,
+
         # runtime
         "in_position": in_position,
         "entry_price": round(entry_price, 4),
         "capital": round(capital, 2),
         "sparen": round(sparen, 2),
         "totaalwaarde": round(capital + sparen, 2),
-        "last_action": datetime.fromtimestamp(last_action_ts).strftime("%d-%m-%Y %H:%M:%S") if last_action_ts > 0 else None,
+        "last_action": last_action_str,
+
         # advisor (lokaal applied)
         "advisor_applied": _advisor_applied(SYMBOL_STR),
-    })
+
+        # lokale TPSL monitor
+        "local_tpsl_enabled": LOCAL_TPSL_ENABLED,
+        "tpsl_state": {
+            "active": tpsl_state.get("active", False),
+            "armed": tpsl_state.get("armed", False),
+            "tp_pct": tpsl_state.get("tp_pct"),
+            "sl_pct": tpsl_state.get("sl_pct"),
+            "trail_pct": tpsl_state.get("trail_pct"),
+            "arm_at_pct": tpsl_state.get("arm_at_pct"),
+        },
+    }
+    return jsonify(payload)
 
 def idle_worker():
     while True:
         time.sleep(PRICE_POLL_S)
         try:
-            forced_exit_check()
+            last, src = fetch_last_price_any(SYMBOL_TV)
+            # optioneel loggen:
+            # print(f"[PRICE] via {src}: {last}")
+            # Eerst lokale TPSL, dan safety-net:
+            local_tpsl_check(last)
+            forced_exit_check(last)
         except Exception as e:
-            print(f"[IDLE] error: {e}", flush=True)
+            print(f"[IDLE] error: {e}")
             continue
 
 if __name__ == "__main__":
