@@ -497,10 +497,11 @@ def _make_client(name: str):
     if name == "binance":
         return ccxt.binance({"enableRateLimit": True})
     if name == "bybit":
-        # spot voor XRP/USDT
+        # forceer SPOT
         return ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "spot"}})
     if name == "okx":
-        return ccxt.okx({"enableRateLimit": True})
+        # forceer SPOT (anders kan ccxt per ongeluk futures/SWAP kiezen)
+        return ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "spot"}})
     raise ValueError(f"unknown exchange: {name}")
 
 def _sources_order():
