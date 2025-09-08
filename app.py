@@ -875,8 +875,17 @@ def webhook():
                 return "OK", 200
 
         if entry_price <= 0:
-            _dbg("sell guard: invalid entry_price")
-            return "No valid entry", 400
+            _dbg("sell guard: entry_price missing; trying rehydrate for entry")
+            if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+                try:
+                    if _rehydrate_from_mexc() and entry_price > 0:
+                        _dbg(f"[REHYDRATE] filled entry≈{entry_price}; continuing SELL")
+                    else:
+                        _dbg("[REHYDRATE] no entry; proceed with live SELL and PnL=0")
+                        entry_price = price  # veilige fallback: PnL~0
+                except Exception as e:
+                    _dbg(f"[REHYDRATE] entry fetch failed: {e}; proceed with PnL=0")
+                    entry_price = price
 
         # --- LIVE SELL on MEXC (optional) ---
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
