@@ -112,12 +112,6 @@ sparen  = SPAREN_START
 pos_amount = 0.0  # hoeveelheid XRP in live modus
 
 
-# On boot: rehydrate een bestaande live positie (indien gewenst)
-if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
-    try:
-        _rehydrate_from_mexc()
-    except Exception as _e:
-        _dbg(f"[REHYDRATE] on boot error: {_e}")
 last_action_ts = 0.0
 last_signal_key_ts = {}     # (action, source, round(price,4), tf) -> ts
 
@@ -660,6 +654,13 @@ def _rehydrate_from_mexc():
     return False
 
 
+
+# On boot: rehydrate een bestaande live positie (indien gewenst)
+if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
+    try:
+        _rehydrate_from_mexc()
+    except Exception as _e:
+        _dbg(f"[REHYDRATE] on boot error: {_e}")
 # --- Flask ---
 app = Flask(__name__)
 
