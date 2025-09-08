@@ -450,13 +450,14 @@ def _get_spot_price() -> float | None:
     return None
 
 def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
-    """Voer een SELL uit met exact dezelfde boekhouding/logica als in je webhook."""
-    global in_position, entry_price, capital, sparen, last_action_ts
+    """Voer een SELL uit buiten de normale flow (TPSL/max-hold/manual), met jouw bestaande boekhouding."""
+    global in_position, entry_price, capital, sparen, last_action_ts, pos_amount
 
-    , pos_amountif not in_position or entry_price <= 0:
+    # Alleen als er echt een positie open staat
+    if not in_position or entry_price <= 0:
         return False
 
-    # LIVE exit indien actief (MEXC)
+    # --- LIVE exit indien actief (MEXC) ---
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
         try:
             ex = _mexc_live()
@@ -464,7 +465,7 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
             if amt > 0:
                 order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
                 avg = order.get("average") or order.get("price") or price
-                price = float(avg)
+                price = float(avg)  # gebruik daadwerkelijke exit-prijs voor PnL
                 _dbg(f"[LIVE] MEXC FORCED SELL id={order.get('id')} filled={order.get('filled')} avg={price}")
             else:
                 _dbg("[LIVE] forced sell skipped: pos_amount=0")
@@ -472,7 +473,9 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
             _dbg(f"[LIVE] MEXC FORCED SELL failed: {e}")
             # Lokale afwikkeling gaat door; we loggen dit
         pos_amount = 0.0
+    # --------------------------------------
 
+    # PnL en boeking (zoals in jouw SELL)
     verkoop_bedrag = price * START_CAPITAL / entry_price
     winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
 
@@ -489,8 +492,20 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
             sparen -= tekort
             capital += tekort
 
+    # State resetten
     in_position = False
+    entry_price = 0.0
     last_action_ts = time.time()
+
+    # (optioneel) TPSL resetten als die helper bestaat
+    try:
+        local_tpsl_reset()
+        _dbg("[TPSL] reset on FORCED SELL")
+    except Exception:
+        pass
+
+    return True
+
 
     resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
     timestamp = now_str()
