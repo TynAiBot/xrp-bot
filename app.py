@@ -835,7 +835,7 @@ def webhook():
             tpsl_state["active"]      = True
             tpsl_state["armed"]       = False
             tpsl_state["entry_price"] = price
-            tpsl_state["high_water"]  = price
+            tpsl_state["high"] = price
             tpsl_state["tp_pct"]      = float(ap.get("TAKE_PROFIT_PCT", 0.012))
             tpsl_state["sl_pct"]      = float(ap.get("STOP_LOSS_PCT",   0.018))
             tpsl_state["trail_pct"]   = float(ap.get("TRAIL_PCT",       0.006)) if ap.get("USE_TRAILING", True) else 0.0
@@ -927,7 +927,7 @@ def webhook():
             tpsl_state["active"]      = False
             tpsl_state["armed"]       = False
             tpsl_state["entry_price"] = 0.0
-            tpsl_state["high_water"]  = 0.0
+            tpsl_state["high"] = 0.0
             _dbg("[TPSL] reset on SELL")
 
         # Telegram + log
