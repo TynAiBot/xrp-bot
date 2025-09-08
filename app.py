@@ -1096,6 +1096,10 @@ def config_view():
         "advisor_secret_set": masked(ADVISOR_SECRET),
         "telegram_config_ok": bool(TG_TOKEN and TG_CHAT_ID),
         "trades_file": TRADES_FILE,
+        "hard_sl_pct": round(HARD_SL_PCT, 6),
+        "hard_sl_arm_sec": int(HARD_SL_ARM_SEC),
+        "max_hold_min": int(MAX_HOLD_MIN),
+        "price_poll_s": int(PRICE_POLL_S),
 
         # runtime
         "in_position": in_position,
