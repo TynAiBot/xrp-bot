@@ -807,12 +807,12 @@ def webhook():
 
     timestamp = now_str()
 
-        # Guard: fix ghost position (in_position True but zero size/entry)
-        if in_position and (pos_amount <= 1e-12 or entry_price <= 0):
-            _dbg("[GUARD] fix ghost position: clearing in_position due to zero size/entry")
-            in_position = False
-            entry_price = 0.0
-            pos_amount = 0.0
+    # Guard: fix ghost position (in_position True but zero size/entry)
+    if in_position and (pos_amount <= 1e-12 or entry_price <= 0):
+        _dbg("[GUARD] fix ghost position: clearing in_position due to zero size/entry")
+        in_position = False
+        entry_price = 0.0
+        pos_amount = 0.0
 
     # === BUY ===
     if action == "buy":
