@@ -769,7 +769,8 @@ def webhook():
     timestamp = now_str()
 
     # === BUY ===
-    if action == "buy":
+    if action == "buy":    
+
         if in_position:
             _dbg(f"buy ignored: already in_position at entry={entry_price}")
             return "OK", 200
@@ -780,18 +781,19 @@ def webhook():
             _dbg("blocked by trend filter")
             return "OK", 200
 
-            # --- LIVE BUY on MEXC (optional) ---
-    if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-        try:
-            avg, filled, order = _place_mexc_market("buy", START_CAPITAL, price)
-            price = float(avg)      # gebruik echte fillprijs
-            pos_amount = float(filled)
-            _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg}")
-        except Exception as e:
-            _dbg(f"[LIVE] MEXC BUY failed: {e}")
-            return "LIVE BUY failed", 500
+        # --- LIVE BUY on MEXC (optional) ---
+        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+            try:
+                avg, filled, order = _place_mexc_market("buy", START_CAPITAL, price)
+                price = float(avg)          # gebruik echte fillprijs
+                pos_amount = float(filled)  # bewaar gekochte hoeveelheid XRP
+                _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg}")
+            except Exception as e:
+                _dbg(f"[LIVE] MEXC BUY failed: {e}")
+                return "LIVE BUY failed", 500
+        # ------------------------------------
 
-entry_price = price
+        entry_price = price
         in_position = True
         last_action_ts = time.time()
         entry_ts = time.time()
@@ -800,14 +802,14 @@ entry_price = price
         # --- (5) ARM LOKALE TPSL OP BUY ---
         if LOCAL_TPSL_ENABLED:
             ap = _advisor_applied(SYMBOL_STR)  # neem actuele params over
-            tpsl_state["active"]     = True
-            tpsl_state["armed"]      = False
-            tpsl_state["entry_price"]= price
-            tpsl_state["high_water"] = price
-            tpsl_state["tp_pct"]     = float(ap.get("TAKE_PROFIT_PCT", 0.012))
-            tpsl_state["sl_pct"]     = float(ap.get("STOP_LOSS_PCT",   0.018))
-            tpsl_state["trail_pct"]  = float(ap.get("TRAIL_PCT",       0.006)) if ap.get("USE_TRAILING", True) else 0.0
-            tpsl_state["arm_at_pct"] = float(ap.get("ARM_AT_PCT",      0.004))
+            tpsl_state["active"]      = True
+            tpsl_state["armed"]       = False
+            tpsl_state["entry_price"] = price
+            tpsl_state["high_water"]  = price
+            tpsl_state["tp_pct"]      = float(ap.get("TAKE_PROFIT_PCT", 0.012))
+            tpsl_state["sl_pct"]      = float(ap.get("STOP_LOSS_PCT",   0.018))
+            tpsl_state["trail_pct"]   = float(ap.get("TRAIL_PCT",       0.006)) if ap.get("USE_TRAILING", True) else 0.0
+            tpsl_state["arm_at_pct"]  = float(ap.get("ARM_AT_PCT",      0.004))
             _dbg(f"[TPSL] armed on BUY: {tpsl_state}")
 
         send_tg(
