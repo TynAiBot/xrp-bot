@@ -44,6 +44,7 @@ SPAREN_START  = float(os.getenv("SPAREN_START",  "500"))
 LIVE_MODE = env_bool("LIVE_MODE", True)
 
 LIVE_EXCHANGE = os.getenv("LIVE_EXCHANGE", "").lower()
+REHYDRATE_ON_BOOT = env_bool("REHYDRATE_ON_BOOT", True)
 # --- Local safety net (guardrails) ---
 HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8% hard stop
 MAX_HOLD_MIN  = int(os.getenv("MAX_HOLD_MIN", "45"))      # force exit na 45 min
@@ -109,6 +110,14 @@ entry_price = 0.0
 capital = START_CAPITAL
 sparen  = SPAREN_START
 pos_amount = 0.0  # hoeveelheid XRP in live modus
+
+
+# On boot: rehydrate een bestaande live positie (indien gewenst)
+if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
+    try:
+        _rehydrate_from_mexc()
+    except Exception as _e:
+        _dbg(f"[REHYDRATE] on boot error: {_e}")
 last_action_ts = 0.0
 last_signal_key_ts = {}     # (action, source, round(price,4), tf) -> ts
 
@@ -450,14 +459,13 @@ def _get_spot_price() -> float | None:
     return None
 
 def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
-    """Voer een SELL uit buiten de normale flow (TPSL/max-hold/manual), met jouw bestaande boekhouding."""
+    """Voer een SELL uit met exact dezelfde boekhouding/logica als in je webhook."""
     global in_position, entry_price, capital, sparen, last_action_ts, pos_amount
 
-    # Alleen als er echt een positie open staat
     if not in_position or entry_price <= 0:
         return False
 
-    # --- LIVE exit indien actief (MEXC) ---
+    # LIVE exit indien actief (MEXC)
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
         try:
             ex = _mexc_live()
@@ -465,7 +473,7 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
             if amt > 0:
                 order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
                 avg = order.get("average") or order.get("price") or price
-                price = float(avg)  # gebruik daadwerkelijke exit-prijs voor PnL
+                price = float(avg)
                 _dbg(f"[LIVE] MEXC FORCED SELL id={order.get('id')} filled={order.get('filled')} avg={price}")
             else:
                 _dbg("[LIVE] forced sell skipped: pos_amount=0")
@@ -473,11 +481,9 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
             _dbg(f"[LIVE] MEXC FORCED SELL failed: {e}")
             # Lokale afwikkeling gaat door; we loggen dit
         pos_amount = 0.0
-    # --------------------------------------
 
-    # PnL en boeking (zoals in jouw SELL)
     verkoop_bedrag = price * START_CAPITAL / entry_price
-    winst_bedrag   = round(verkoop_bedrag - START_CAPITAL, 2)
+    winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
 
     if winst_bedrag > 0:
         sparen  += SAVINGS_SPLIT * winst_bedrag
@@ -492,19 +498,8 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
             sparen -= tekort
             capital += tekort
 
-    # State resetten
     in_position = False
-    entry_price = 0.0
     last_action_ts = time.time()
-
-    # (optioneel) TPSL resetten als die helper bestaat
-    try:
-        local_tpsl_reset()
-        _dbg("[TPSL] reset on FORCED SELL")
-    except Exception:
-        pass
-
-    return True
 
     resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
     timestamp = now_str()
@@ -627,6 +622,42 @@ def _place_mexc_market(side: str, quote_amount_usd: float, ref_price: float):
     avg = order.get("average") or order.get("price") or ref_price
     filled = order.get("filled") or amount
     return float(avg), float(filled), order
+
+# Rehydrate state from MEXC (spot) — called on boot and lazily when needed
+def _rehydrate_from_mexc():
+    global in_position, pos_amount, entry_price
+    try:
+        ex = _mexc_live()
+        bal = ex.fetch_balance()
+        xrp = bal.get("XRP") or {}
+        total_amt = float(xrp.get("total") or 0.0)
+        if total_amt > 0:
+            pos_amount = float(ex.amount_to_precision(SYMBOL_TV, total_amt))
+            in_position = True
+            # Try to estimate entry from recent trades (last 7 days)
+            try:
+                import time as _time
+                since = int((_time.time() - 7*24*3600) * 1000)
+                trades = ex.fetch_my_trades(SYMBOL_TV, since=since)
+                net = 0.0; cost = 0.0
+                for t in trades:
+                    amt = float(t.get("amount") or 0.0)
+                    price = float(t.get("price") or 0.0)
+                    if t.get("side") == "buy":
+                        net += amt; cost += amt * price
+                    elif t.get("side") == "sell":
+                        net -= amt; cost -= amt * price
+                    if net <= 1e-12:
+                        net, cost = 0.0, 0.0
+                if net > 0 and cost > 0:
+                    entry_price = cost / net
+            except Exception as e2:
+                _dbg(f"[REHYDRATE] trade-based entry calc failed: {e2}")
+            _dbg(f"[REHYDRATE] detected XRP position amt={pos_amount}, entry≈{entry_price}")
+            return True
+    except Exception as e:
+        _dbg(f"[REHYDRATE] failed: {e}")
+    return False
 
 
 # --- Flask ---
@@ -768,8 +799,7 @@ def webhook():
     timestamp = now_str()
 
     # === BUY ===
-    if action == "buy":    
-
+    if action == "buy":
         if in_position:
             _dbg(f"buy ignored: already in_position at entry={entry_price}")
             return "OK", 200
@@ -780,19 +810,18 @@ def webhook():
             _dbg("blocked by trend filter")
             return "OK", 200
 
-        # --- LIVE BUY on MEXC (optional) ---
-        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-            try:
-                avg, filled, order = _place_mexc_market("buy", START_CAPITAL, price)
-                price = float(avg)          # gebruik echte fillprijs
-                pos_amount = float(filled)  # bewaar gekochte hoeveelheid XRP
-                _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg}")
-            except Exception as e:
-                _dbg(f"[LIVE] MEXC BUY failed: {e}")
-                return "LIVE BUY failed", 500
-        # ------------------------------------
+            # --- LIVE BUY on MEXC (optional) ---
+    if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+        try:
+            avg, filled, order = _place_mexc_market("buy", START_CAPITAL, price)
+            price = float(avg)      # gebruik echte fillprijs
+            pos_amount = float(filled)
+            _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg}")
+        except Exception as e:
+            _dbg(f"[LIVE] MEXC BUY failed: {e}")
+            return "LIVE BUY failed", 500
 
-        entry_price = price
+entry_price = price
         in_position = True
         last_action_ts = time.time()
         entry_ts = time.time()
@@ -801,14 +830,14 @@ def webhook():
         # --- (5) ARM LOKALE TPSL OP BUY ---
         if LOCAL_TPSL_ENABLED:
             ap = _advisor_applied(SYMBOL_STR)  # neem actuele params over
-            tpsl_state["active"]      = True
-            tpsl_state["armed"]       = False
-            tpsl_state["entry_price"] = price
-            tpsl_state["high_water"]  = price
-            tpsl_state["tp_pct"]      = float(ap.get("TAKE_PROFIT_PCT", 0.012))
-            tpsl_state["sl_pct"]      = float(ap.get("STOP_LOSS_PCT",   0.018))
-            tpsl_state["trail_pct"]   = float(ap.get("TRAIL_PCT",       0.006)) if ap.get("USE_TRAILING", True) else 0.0
-            tpsl_state["arm_at_pct"]  = float(ap.get("ARM_AT_PCT",      0.004))
+            tpsl_state["active"]     = True
+            tpsl_state["armed"]      = False
+            tpsl_state["entry_price"]= price
+            tpsl_state["high_water"] = price
+            tpsl_state["tp_pct"]     = float(ap.get("TAKE_PROFIT_PCT", 0.012))
+            tpsl_state["sl_pct"]     = float(ap.get("STOP_LOSS_PCT",   0.018))
+            tpsl_state["trail_pct"]  = float(ap.get("TRAIL_PCT",       0.006)) if ap.get("USE_TRAILING", True) else 0.0
+            tpsl_state["arm_at_pct"] = float(ap.get("ARM_AT_PCT",      0.004))
             _dbg(f"[TPSL] armed on BUY: {tpsl_state}")
 
         send_tg(
@@ -832,31 +861,40 @@ def webhook():
         if not in_position:
             _dbg("sell ignored: not in_position")
             return "OK", 200
+        # Lazy rehydrate: service kan herstart zijn terwijl een positie open stond
+        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+            try:
+                if _rehydrate_from_mexc():
+                    _dbg("[REHYDRATE] success; continuing SELL flow")
+                else:
+                    _dbg("[REHYDRATE] no live position found")
+            except Exception as e:
+                _dbg(f"[REHYDRATE] lazy failed: {e}")
+        if not in_position:
+            return "OK", 200
         if entry_price <= 0:
             _dbg("sell guard: invalid entry_price")
             return "No valid entry", 400
 
-        # --- LIVE SELL on MEXC (optional) ---
-        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-            try:
-                ex = _mexc_live()
-                amt = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
-                if amt > 0:
-                    order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
-                    avg = order.get("average") or order.get("price") or price
-                    price = float(avg)   # gebruik daadwerkelijke exit-prijs
-                    _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={order.get('filled')} avg={price}")
-                else:
-                    _dbg("[LIVE] MEXC SELL skipped: pos_amount=0")
-            except Exception as e:
-                _dbg(f"[LIVE] MEXC SELL failed: {e}")
-                return "LIVE SELL failed", 500
-        pos_amount = 0.0
-        # ------------------------------------
+            # --- LIVE SELL on MEXC (optional) ---
+    if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+        try:
+            ex = _mexc_live()
+            amt = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
+            if amt > 0:
+                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                avg = order.get("average") or order.get("price") or price
+                price = float(avg)   # gebruik daadwerkelijke exit-prijs
+                _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={order.get('filled')} avg={price}")
+            else:
+                _dbg("[LIVE] MEXC SELL skipped: pos_amount=0")
+        except Exception as e:
+            _dbg(f"[LIVE] MEXC SELL failed: {e}")
+            return "LIVE SELL failed", 500
+    pos_amount = 0.0
 
-        # PnL & boeking
-        verkoop_bedrag = price * START_CAPITAL / entry_price
-        winst_bedrag   = round(verkoop_bedrag - START_CAPITAL, 2)
+verkoop_bedrag = price * START_CAPITAL / entry_price
+        winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
         _dbg(f"SELL calc -> price={price} entry={entry_price} pnl={winst_bedrag}")
 
         if winst_bedrag > 0:
@@ -872,15 +910,13 @@ def webhook():
                 sparen -= tekort
                 capital += tekort
 
-        # State reset
         in_position = False
-        entry_price = 0.0
         last_action_ts = time.time()
 
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
         _dbg(f"SELL executed -> {resultaat}={winst_bedrag}, capital={capital}, sparen={sparen}")
 
-        # --- RESET LOKALE TPSL NA SELL ---
+        # --- (5) RESET LOKALE TPSL NA SELL ---
         if LOCAL_TPSL_ENABLED:
             tpsl_state["active"]      = False
             tpsl_state["armed"]       = False
@@ -888,7 +924,6 @@ def webhook():
             tpsl_state["high_water"]  = 0.0
             _dbg("[TPSL] reset on SELL")
 
-        # Telegram bericht
         send_tg(
             f"""📄 <b>[XRP/USDT] VERKOOP</b>
 📹 Verkoopprijs: ${price:.4f}
@@ -902,11 +937,14 @@ def webhook():
 🔗 Tijd: {timestamp}"""
         )
 
-        # Logtrade
+        # log (winst/verlies vastleggen)
         log_trade("sell", price, winst_bedrag, source, tf)
-
+        entry_price = 0.0
         return "OK", 200
 
+    # Fallback
+    _dbg("unknown path fallthrough (should not happen)")
+    return "OK", 200
 
 # --- Rapportage ---
 @app.route("/report/daily", methods=["GET"])
