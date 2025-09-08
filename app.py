@@ -50,6 +50,7 @@ REHYDRATE_MIN_XRP = float(os.getenv("REHYDRATE_MIN_XRP", "5"))  # ignore dust be
 HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8% hard stop
 MAX_HOLD_MIN  = int(os.getenv("MAX_HOLD_MIN", "45"))      # force exit na 45 min
 PRICE_POLL_S  = int(os.getenv("PRICE_POLL_S", "5"))       # elke 5s prijs checken
+HARD_SL_ARM_SEC = int(os.getenv("HARD_SL_ARM_SEC", "15"))  # wait N seconds after BUY before hard SL can trigger
 # Data-bron voor koers/klines: 'auto' (binance→bybit→okx), of forceer 'binance' | 'bybit' | 'okx'
 EXCHANGE_SOURCE = os.getenv("EXCHANGE_SOURCE", "auto").lower()  # auto
 entry_ts = 0.0  # timestamp van laatste BUY (voor hold-timer)
@@ -113,6 +114,12 @@ sparen  = SPAREN_START
 pos_amount = 0.0  # hoeveelheid XRP in live modus
 
 
+# On boot: rehydrate een bestaande live positie (indien gewenst)
+if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
+    try:
+        _rehydrate_from_mexc()
+    except Exception as _e:
+        _dbg(f"[REHYDRATE] on boot error: {_e}")
 last_action_ts = 0.0
 last_signal_key_ts = {}     # (action, source, round(price,4), tf) -> ts
 
@@ -514,30 +521,48 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
     log_trade("sell", price, winst_bedrag, source, tf)
     return True
 
+
 def forced_exit_check(last_price: float | None = None):
-    """Check hard SL en max-hold. Roept _do_forced_sell aan indien nodig."""
+    """Check hard SL en max-hold. Bevestig SL met MEXC en arm pas na enkele seconden."""
     if not in_position or entry_price <= 0:
+        return
+
+    # Grace period na entry
+    if HARD_SL_ARM_SEC > 0 and entry_ts > 0 and (time.time() - entry_ts) < HARD_SL_ARM_SEC:
         return
 
     # Haal prijs (of gebruik aangeleverde)
     if last_price is None:
         try:
             last_price, src = fetch_last_price_any(SYMBOL_TV)
-            print(f"[PRICE] via {src}: {last_price}")
-        except Exception as e:
-            print(f"[PRICE] fetch fail all: {e}")
+        except Exception:
             return
 
-    # Hard stop-loss
-    if HARD_SL_PCT > 0 and last_price <= entry_price * (1.0 - HARD_SL_PCT):
-        _do_forced_sell(last_price, f"hard_sl_{HARD_SL_PCT:.3%}")
-        return
+    # Hard stop-loss (met bevestiging op MEXC)
+    if HARD_SL_PCT > 0:
+        threshold = entry_price * (1.0 - HARD_SL_PCT)
+        if last_price <= threshold:
+            # Bevestig direct op MEXC om spikes te filteren
+            try:
+                ex = _get_client("mexc")
+                t = ex.fetch_ticker(SYMBOL_TV)
+                mexc_last = float(t.get("last") or t.get("close") or 0.0)
+            except Exception:
+                mexc_last = last_price
+            if mexc_last > 0 and mexc_last <= threshold:
+                _do_forced_sell(mexc_last, f"hard_sl_{HARD_SL_PCT:.3%}")
+                return
 
     # Max hold tijd
     if MAX_HOLD_MIN > 0 and entry_ts > 0 and (time.time() - entry_ts) >= MAX_HOLD_MIN * 60:
-        _do_forced_sell(last_price, f"max_hold_{MAX_HOLD_MIN}m")
+        try:
+            ex = _get_client("mexc")
+            t = ex.fetch_ticker(SYMBOL_TV)
+            mexc_last = float(t.get("last") or t.get("close") or 0.0)
+        except Exception:
+            mexc_last = last_price or entry_price
+        _do_forced_sell(mexc_last, f"max_hold_{MAX_HOLD_MIN}m")
         return
-
 # ------- Multi-exchange fallbacks (klines/price) -------
 def _make_client(name: str):
     if name == "binance":
@@ -553,6 +578,31 @@ def _make_client(name: str):
         return ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "spot"}})
     raise ValueError(f"unknown exchange: {name}")
 
+
+# --- CCXT client cache for public endpoints (reduces API noise/rate limits) ---
+CLIENTS = {}
+
+def _get_client(name: str):
+    name = (name or "").lower()
+    if name in CLIENTS:
+        return CLIENTS[name]
+    if name == "binance":
+        ex = ccxt.binance({"enableRateLimit": True})
+    elif name == "bybit":
+        ex = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+    elif name == "okx":
+        ex = ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+    elif name == "mexc":
+        ex = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+    else:
+        raise ValueError(f"unknown exchange: {name}")
+    try:
+        ex.load_markets()
+    except Exception as e:
+        _dbg(f"[CCXT] load_markets {name} failed: {e}")
+    CLIENTS[name] = ex
+    return ex
+
 def _sources_order():
     src = EXCHANGE_SOURCE.lower()
     if src == "auto":
@@ -563,7 +613,7 @@ def fetch_ohlcv_any(symbol_tv="XRP/USDT", timeframe="1m", limit=210):
     errs = []
     for name in _sources_order():
         try:
-            ex = _make_client(name)
+            ex = _get_client(name)
             data = ex.fetch_ohlcv(symbol_tv, timeframe=timeframe, limit=limit)
             return data, name
         except Exception as e:
@@ -574,7 +624,7 @@ def fetch_last_price_any(symbol_tv="XRP/USDT"):
     errs = []
     for name in _sources_order():
         try:
-            ex = _make_client(name)
+            ex = _get_client(name)
             t = ex.fetch_ticker(symbol_tv)
             last = float(t.get("last") or t.get("close") or t.get("info", {}).get("lastPrice") or 0.0)
             if last > 0:
@@ -663,12 +713,7 @@ def _rehydrate_from_mexc():
         return False
 
 
-# On boot: rehydrate een bestaande live positie (indien gewenst)
-if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
-    try:
-        _rehydrate_from_mexc()
-    except Exception as _e:
-        _dbg(f"[REHYDRATE] on boot error: {_e}")
+# --- Flask ---
 
 app = Flask(__name__)
 
@@ -807,12 +852,13 @@ def webhook():
 
     timestamp = now_str()
 
-    # Guard: fix ghost position (in_position True but zero size/entry)
-    if in_position and (pos_amount <= 1e-12 or entry_price <= 0):
-        _dbg("[GUARD] fix ghost position: clearing in_position due to zero size/entry")
-        in_position = False
-        entry_price = 0.0
-        pos_amount = 0.0
+
+# Guard: fix ghost position (in_position True but zero size/entry)
+if in_position and (pos_amount <= 1e-12 or entry_price <= 0):
+    _dbg("[GUARD] fix ghost position: clearing in_position due to zero size/entry")
+    in_position = False
+    entry_price = 0.0
+    pos_amount = 0.0
 
     # === BUY ===
     if action == "buy":
