@@ -45,6 +45,7 @@ LIVE_MODE = env_bool("LIVE_MODE", True)
 
 LIVE_EXCHANGE = os.getenv("LIVE_EXCHANGE", "").lower()
 REHYDRATE_ON_BOOT = env_bool("REHYDRATE_ON_BOOT", True)
+REHYDRATE_MIN_XRP = float(os.getenv("REHYDRATE_MIN_XRP", "5"))  # ignore dust below this amount
 # --- Local safety net (guardrails) ---
 HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8% hard stop
 MAX_HOLD_MIN  = int(os.getenv("MAX_HOLD_MIN", "45"))      # force exit na 45 min
@@ -618,6 +619,7 @@ def _place_mexc_market(side: str, quote_amount_usd: float, ref_price: float):
     return float(avg), float(filled), order
 
 # Rehydrate state from MEXC (spot) — called on boot and lazily when needed
+
 def _rehydrate_from_mexc():
     global in_position, pos_amount, entry_price
     try:
@@ -625,7 +627,8 @@ def _rehydrate_from_mexc():
         bal = ex.fetch_balance()
         xrp = bal.get("XRP") or {}
         total_amt = float(xrp.get("total") or 0.0)
-        if total_amt > 0:
+        # Ignore tiny dust positions
+        if total_amt >= REHYDRATE_MIN_XRP:
             pos_amount = float(ex.amount_to_precision(SYMBOL_TV, total_amt))
             in_position = True
             # Try to estimate entry from recent trades (last 7 days)
@@ -649,10 +652,15 @@ def _rehydrate_from_mexc():
                 _dbg(f"[REHYDRATE] trade-based entry calc failed: {e2}")
             _dbg(f"[REHYDRATE] detected XRP position amt={pos_amount}, entry≈{entry_price}")
             return True
+        else:
+            _dbg(f"[REHYDRATE] small dust {total_amt} XRP -> ignore")
+            pos_amount = 0.0
+            entry_price = 0.0
+            in_position = False
+            return False
     except Exception as e:
         _dbg(f"[REHYDRATE] failed: {e}")
-    return False
-
+        return False
 
 
 # On boot: rehydrate een bestaande live positie (indien gewenst)
@@ -661,7 +669,7 @@ if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
         _rehydrate_from_mexc()
     except Exception as _e:
         _dbg(f"[REHYDRATE] on boot error: {_e}")
-# --- Flask ---
+
 app = Flask(__name__)
 
 # ===== Embedded Advisor endpoints =====
@@ -799,6 +807,13 @@ def webhook():
 
     timestamp = now_str()
 
+        # Guard: fix ghost position (in_position True but zero size/entry)
+        if in_position and (pos_amount <= 1e-12 or entry_price <= 0):
+            _dbg("[GUARD] fix ghost position: clearing in_position due to zero size/entry")
+            in_position = False
+            entry_price = 0.0
+            pos_amount = 0.0
+
     # === BUY ===
     if action == "buy":
         if in_position:
@@ -835,7 +850,7 @@ def webhook():
             tpsl_state["active"]      = True
             tpsl_state["armed"]       = False
             tpsl_state["entry_price"] = price
-            tpsl_state["high"] = price
+            tpsl_state["high"]  = price
             tpsl_state["tp_pct"]      = float(ap.get("TAKE_PROFIT_PCT", 0.012))
             tpsl_state["sl_pct"]      = float(ap.get("STOP_LOSS_PCT",   0.018))
             tpsl_state["trail_pct"]   = float(ap.get("TRAIL_PCT",       0.006)) if ap.get("USE_TRAILING", True) else 0.0
@@ -876,16 +891,18 @@ def webhook():
 
         if entry_price <= 0:
             _dbg("sell guard: entry_price missing; trying rehydrate for entry")
+            missing_entry = True
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
                     if _rehydrate_from_mexc() and entry_price > 0:
                         _dbg(f"[REHYDRATE] filled entry≈{entry_price}; continuing SELL")
+                        missing_entry = False
                     else:
-                        _dbg("[REHYDRATE] no entry; proceed with live SELL and PnL=0")
-                        entry_price = price  # veilige fallback: PnL~0
+                        _dbg("[REHYDRATE] no entry; will fallback after live SELL")
                 except Exception as e:
-                    _dbg(f"[REHYDRATE] entry fetch failed: {e}; proceed with PnL=0")
-                    entry_price = price
+                    _dbg(f"[REHYDRATE] entry fetch failed: {e}; will fallback after live SELL")
+            else:
+                _dbg("[SELL] no rehydrate; will fallback after live SELL")
 
         # --- LIVE SELL on MEXC (optional) ---
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
@@ -904,6 +921,14 @@ def webhook():
                 return "LIVE SELL failed", 500
         pos_amount = 0.0
         # ------------------------------------
+
+        # If entry was missing, fallback to exit avg now (PnL≈0)
+        try:
+            if "missing_entry" in locals() and missing_entry and entry_price <= 0:
+                _dbg("[SELL] entry missing -> fallback set to exit avg for PnL≈0")
+                entry_price = price
+        except Exception:
+            pass
 
         # PnL & boeking
         verkoop_bedrag = price * START_CAPITAL / entry_price
@@ -936,7 +961,7 @@ def webhook():
             tpsl_state["active"]      = False
             tpsl_state["armed"]       = False
             tpsl_state["entry_price"] = 0.0
-            tpsl_state["high"] = 0.0
+            tpsl_state["high"]  = 0.0
             _dbg("[TPSL] reset on SELL")
 
         # Telegram + log
