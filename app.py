@@ -477,7 +477,7 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
 
     # PnL en boeking (zoals in jouw SELL)
     verkoop_bedrag = price * START_CAPITAL / entry_price
-    winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
+    winst_bedrag   = round(verkoop_bedrag - START_CAPITAL, 2)
 
     if winst_bedrag > 0:
         sparen  += SAVINGS_SPLIT * winst_bedrag
@@ -505,7 +505,6 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
         pass
 
     return True
-
 
     resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
     timestamp = now_str()
@@ -837,25 +836,27 @@ def webhook():
             _dbg("sell guard: invalid entry_price")
             return "No valid entry", 400
 
-            # --- LIVE SELL on MEXC (optional) ---
-    if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-        try:
-            ex = _mexc_live()
-            amt = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
-            if amt > 0:
-                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
-                avg = order.get("average") or order.get("price") or price
-                price = float(avg)   # gebruik daadwerkelijke exit-prijs
-                _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={order.get('filled')} avg={price}")
-            else:
-                _dbg("[LIVE] MEXC SELL skipped: pos_amount=0")
-        except Exception as e:
-            _dbg(f"[LIVE] MEXC SELL failed: {e}")
-            return "LIVE SELL failed", 500
-    pos_amount = 0.0
+        # --- LIVE SELL on MEXC (optional) ---
+        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+            try:
+                ex = _mexc_live()
+                amt = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
+                if amt > 0:
+                    order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                    avg = order.get("average") or order.get("price") or price
+                    price = float(avg)   # gebruik daadwerkelijke exit-prijs
+                    _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={order.get('filled')} avg={price}")
+                else:
+                    _dbg("[LIVE] MEXC SELL skipped: pos_amount=0")
+            except Exception as e:
+                _dbg(f"[LIVE] MEXC SELL failed: {e}")
+                return "LIVE SELL failed", 500
+        pos_amount = 0.0
+        # ------------------------------------
 
-verkoop_bedrag = price * START_CAPITAL / entry_price
-        winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
+        # PnL & boeking
+        verkoop_bedrag = price * START_CAPITAL / entry_price
+        winst_bedrag   = round(verkoop_bedrag - START_CAPITAL, 2)
         _dbg(f"SELL calc -> price={price} entry={entry_price} pnl={winst_bedrag}")
 
         if winst_bedrag > 0:
@@ -871,13 +872,15 @@ verkoop_bedrag = price * START_CAPITAL / entry_price
                 sparen -= tekort
                 capital += tekort
 
+        # State reset
         in_position = False
+        entry_price = 0.0
         last_action_ts = time.time()
 
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
         _dbg(f"SELL executed -> {resultaat}={winst_bedrag}, capital={capital}, sparen={sparen}")
 
-        # --- (5) RESET LOKALE TPSL NA SELL ---
+        # --- RESET LOKALE TPSL NA SELL ---
         if LOCAL_TPSL_ENABLED:
             tpsl_state["active"]      = False
             tpsl_state["armed"]       = False
@@ -885,6 +888,7 @@ verkoop_bedrag = price * START_CAPITAL / entry_price
             tpsl_state["high_water"]  = 0.0
             _dbg("[TPSL] reset on SELL")
 
+        # Telegram bericht
         send_tg(
             f"""📄 <b>[XRP/USDT] VERKOOP</b>
 📹 Verkoopprijs: ${price:.4f}
@@ -898,14 +902,11 @@ verkoop_bedrag = price * START_CAPITAL / entry_price
 🔗 Tijd: {timestamp}"""
         )
 
-        # log (winst/verlies vastleggen)
+        # Logtrade
         log_trade("sell", price, winst_bedrag, source, tf)
-        entry_price = 0.0
+
         return "OK", 200
 
-    # Fallback
-    _dbg("unknown path fallthrough (should not happen)")
-    return "OK", 200
 
 # --- Rapportage ---
 @app.route("/report/daily", methods=["GET"])
