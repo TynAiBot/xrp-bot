@@ -113,6 +113,9 @@ capital = START_CAPITAL
 sparen  = SPAREN_START
 pos_amount = 0.0  # hoeveelheid XRP in live modus
 
+LAST_PRICE_SRC = None
+LAST_PRICE_VAL = None
+
 
 # On boot: rehydrate een bestaande live positie (indien gewenst)
 if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
@@ -629,6 +632,9 @@ def fetch_last_price_any(symbol_tv="XRP/USDT"):
             last = float(t.get("last") or t.get("close") or t.get("info", {}).get("lastPrice") or 0.0)
             if last > 0:
                 return last, name
+            global LAST_PRICE_SRC, LAST_PRICE_VAL
+            LAST_PRICE_SRC = name
+            LAST_PRICE_VAL = last
             raise Exception("no last price")
         except Exception as e:
             errs.append(f"{name}: {e}")
@@ -853,8 +859,8 @@ def webhook():
     timestamp = now_str()
 
 
-# Guard: fix ghost position (in_position True but zero size/entry)
-if in_position and (pos_amount <= 1e-12 or entry_price <= 0):
+    # Guard: fix ghost position (in_position True but zero size/entry)
+    if in_position and (pos_amount <= 1e-12 or entry_price <= 0):
     _dbg("[GUARD] fix ghost position: clearing in_position due to zero size/entry")
     in_position = False
     entry_price = 0.0
