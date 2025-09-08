@@ -117,12 +117,6 @@ LAST_PRICE_SRC = None
 LAST_PRICE_VAL = None
 
 
-# On boot: rehydrate een bestaande live positie (indien gewenst)
-if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
-    try:
-        _rehydrate_from_mexc()
-    except Exception as _e:
-        _dbg(f"[REHYDRATE] on boot error: {_e}")
 last_action_ts = 0.0
 last_signal_key_ts = {}     # (action, source, round(price,4), tf) -> ts
 
@@ -1144,6 +1138,13 @@ def idle_worker():
 if __name__ == "__main__":
     _advisor_load()  # laad persistente advisor-config
     load_trades()    # probeer bestaande log in te lezen bij start
+
+    # On boot: rehydrate live positie (na function defs)
+    if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
+        try:
+            _rehydrate_from_mexc()
+        except Exception as _e:
+            _dbg(f"[REHYDRATE] on boot error: {_e}")
     port = int(os.environ.get("PORT", "5000"))
     print(f"✅ Webhook server op http://0.0.0.0:{port}/webhook")
     Thread(target=idle_worker, daemon=True).start()
