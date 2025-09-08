@@ -2,6 +2,29 @@
 # + Persistente trade-logging (JSON-bestand) + /report/daily en /report/weekly + /advisor admin
 
 import os, time, json
+
+# --- Env parsing helpers (robust booleans/ints/floats) ---
+def env_bool(name: str, default=False) -> bool:
+    val = os.getenv(name, None)
+    if val is None:
+        return bool(default)
+    s = str(val).strip().lower()
+    return s in ("1", "true", "t", "yes", "y", "on")
+
+def env_int(name: str, default=0) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except Exception:
+        try:
+            return int(float(os.getenv(name, default)))
+        except Exception:
+            return int(default)
+
+def env_float(name: str, default=0.0) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except Exception:
+        return float(default)
 from datetime import datetime, timedelta
 from threading import Thread
 
@@ -18,8 +41,9 @@ SYMBOL_TV  = "XRP/USDT"        # ccxt notatie
 SYMBOL_STR = "XRPUSDT"         # voor advisor/logs
 START_CAPITAL = float(os.getenv("START_CAPITAL", "500"))
 SPAREN_START  = float(os.getenv("SPAREN_START",  "500"))
-LIVE_MODE     = os.getenv("LIVE_MODE", "1") == "1"
+LIVE_MODE = env_bool("LIVE_MODE", True)
 
+LIVE_EXCHANGE = os.getenv("LIVE_EXCHANGE", "").lower()
 # --- Local safety net (guardrails) ---
 HARD_SL_PCT   = float(os.getenv("HARD_SL_PCT", "0.018"))  # 1.8% hard stop
 MAX_HOLD_MIN  = int(os.getenv("MAX_HOLD_MIN", "45"))      # force exit na 45 min
@@ -36,7 +60,7 @@ MIN_TRADE_COOLDOWN_S = int(os.getenv("MIN_TRADE_COOLDOWN_S", "90"))  # 90s voor 
 DEDUP_WINDOW_S       = int(os.getenv("DEDUP_WINDOW_S",       "30"))  # dezelfde tick/prijs wegfilteren
 
 # Trendfilter
-USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"         # MA200 only-long op BUY
+USE_TREND_FILTER = env_bool("USE_TREND_FILTER", True)         # MA200 only-long op BUY
 TREND_MODE            = os.getenv("TREND_MODE", "soft").lower()   # off|soft|hard
 TREND_MA_LEN          = int(os.getenv("TREND_MA_LEN", "50"))
 TREND_MA_TYPE         = os.getenv("TREND_MA_TYPE", "SMA").upper() # SMA|EMA
@@ -45,17 +69,17 @@ TREND_SLOPE_LOOKBACK  = int(os.getenv("TREND_SLOPE_LOOKBACK", "0"))  # 0=uit
 TREND_SOFT_TOL        = float(os.getenv("TREND_SOFT_TOL", "0.001"))  # 0.1%
 
 # Advisor AAN
-ADVISOR_ENABLED = os.getenv("ADVISOR_ENABLED", "1") == "1"
+ADVISOR_ENABLED = env_bool("ADVISOR_ENABLED", True)
 ADVISOR_URL     = os.getenv("ADVISOR_URL", "")
 ADVISOR_SECRET  = os.getenv("ADVISOR_SECRET", "")
 
 # --- Lokale TPSL monitor ---
-LOCAL_TPSL_ENABLED      = os.getenv("LOCAL_TPSL_ENABLED", "1") == "1"
-SYNC_TPSL_FROM_ADVISOR  = os.getenv("SYNC_TPSL_FROM_ADVISOR", "1") == "1"
+LOCAL_TPSL_ENABLED = env_bool("LOCAL_TPSL_ENABLED", True)
+SYNC_TPSL_FROM_ADVISOR = env_bool("SYNC_TPSL_FROM_ADVISOR", True)
 
 LOCAL_TP_PCT     = float(os.getenv("LOCAL_TP_PCT",     "0.010"))
 LOCAL_SL_PCT     = float(os.getenv("LOCAL_SL_PCT",     "0.009"))
-LOCAL_USE_TRAIL  = os.getenv("LOCAL_USE_TRAIL", "1") == "1"
+LOCAL_USE_TRAIL = env_bool("LOCAL_USE_TRAIL", True)
 LOCAL_TRAIL_PCT  = float(os.getenv("LOCAL_TRAIL_PCT",  "0.007"))
 LOCAL_ARM_AT_PCT = float(os.getenv("LOCAL_ARM_AT_PCT", "0.002"))
 
@@ -72,7 +96,7 @@ if not TG_TOKEN or not TG_CHAT_ID:
 exchange = ccxt.binance({"enableRateLimit": True}) if USE_TREND_FILTER else None
 
 # Debug helper (zet DEBUG_SIG=1 in Render > Environment; zet ook PYTHONUNBUFFERED=1)
-DEBUG_SIG = os.getenv("DEBUG_SIG", "1") == "1"
+DEBUG_SIG = env_bool("DEBUG_SIG", True)
 def _dbg(msg: str):
     if DEBUG_SIG:
         print(f"[SIGDBG] {msg}", flush=True)
@@ -84,6 +108,7 @@ in_position = False
 entry_price = 0.0
 capital = START_CAPITAL
 sparen  = SPAREN_START
+pos_amount = 0.0  # hoeveelheid XRP in live modus
 last_action_ts = 0.0
 last_signal_key_ts = {}     # (action, source, round(price,4), tf) -> ts
 
@@ -428,8 +453,25 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
     """Voer een SELL uit met exact dezelfde boekhouding/logica als in je webhook."""
     global in_position, entry_price, capital, sparen, last_action_ts
 
-    if not in_position or entry_price <= 0:
+    , pos_amountif not in_position or entry_price <= 0:
         return False
+
+    # LIVE exit indien actief (MEXC)
+    if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+        try:
+            ex = _mexc_live()
+            amt = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
+            if amt > 0:
+                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                avg = order.get("average") or order.get("price") or price
+                price = float(avg)
+                _dbg(f"[LIVE] MEXC FORCED SELL id={order.get('id')} filled={order.get('filled')} avg={price}")
+            else:
+                _dbg("[LIVE] forced sell skipped: pos_amount=0")
+        except Exception as e:
+            _dbg(f"[LIVE] MEXC FORCED SELL failed: {e}")
+            # Lokale afwikkeling gaat door; we loggen dit
+        pos_amount = 0.0
 
     verkoop_bedrag = price * START_CAPITAL / entry_price
     winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
@@ -502,12 +544,16 @@ def _make_client(name: str):
     if name == "okx":
         # forceer SPOT (anders kan ccxt per ongeluk futures/SWAP kiezen)
         return ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+    if name == "mexc":
+        # MEXC SPOT
+        return ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "spot"}})
     raise ValueError(f"unknown exchange: {name}")
 
 def _sources_order():
-    if EXCHANGE_SOURCE == "auto":
-        return ["binance", "bybit", "okx"]
-    return [EXCHANGE_SOURCE]
+    src = EXCHANGE_SOURCE.lower()
+    if src == "auto":
+        return ["mexc", "binance", "bybit", "okx"]
+    return [src]
 
 def fetch_ohlcv_any(symbol_tv="XRP/USDT", timeframe="1m", limit=210):
     errs = []
@@ -533,6 +579,41 @@ def fetch_last_price_any(symbol_tv="XRP/USDT"):
         except Exception as e:
             errs.append(f"{name}: {e}")
     raise Exception(" | ".join(errs))
+# --- LIVE trading helpers (MEXC) ---
+def _mexc_live():
+    ak = os.getenv("MEXC_API_KEY", "")
+    sk = os.getenv("MEXC_API_SECRET", "")
+    if not ak or not sk:
+        raise RuntimeError("MEXC_API_KEY/SECRET ontbreken")
+    ex = ccxt.mexc({
+        "apiKey": ak,
+        "secret": sk,
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
+    ex.load_markets()
+    return ex
+
+def _qty_for_quote(ex, symbol, quote_amount, price):
+    raw = max(float(quote_amount) / float(price), 0.0)
+    amt = float(ex.amount_to_precision(symbol, raw))
+    m = ex.market(symbol)
+    min_amt = (m.get("limits") or {}).get("amount", {}).get("min") or 0.0
+    if min_amt and amt < float(min_amt):
+        amt = float(ex.amount_to_precision(symbol, float(min_amt)))
+    return amt
+
+def _place_mexc_market(side: str, quote_amount_usd: float, ref_price: float):
+    ex = _mexc_live()
+    symbol = SYMBOL_TV
+    amount = _qty_for_quote(ex, symbol, quote_amount_usd, ref_price)
+    if amount <= 0:
+        raise RuntimeError("Calculated amount <= 0")
+    order = ex.create_order(symbol, "market", side, amount)
+    avg = order.get("average") or order.get("price") or ref_price
+    filled = order.get("filled") or amount
+    return float(avg), float(filled), order
+
 
 # --- Flask ---
 app = Flask(__name__)
@@ -628,7 +709,7 @@ def is_duplicate_signal(action: str, source: str, price: float, tf: str) -> bool
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global in_position, entry_price, capital, sparen, last_action_ts, entry_ts, tpsl_state
+    global in_position, entry_price, capital, sparen, last_action_ts, entry_ts, tpsl_state, pos_amount
 
     # Secret check
     if WEBHOOK_SECRET:
@@ -684,7 +765,18 @@ def webhook():
             _dbg("blocked by trend filter")
             return "OK", 200
 
-        entry_price = price
+            # --- LIVE BUY on MEXC (optional) ---
+    if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+        try:
+            avg, filled, order = _place_mexc_market("buy", START_CAPITAL, price)
+            price = float(avg)      # gebruik echte fillprijs
+            pos_amount = float(filled)
+            _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg}")
+        except Exception as e:
+            _dbg(f"[LIVE] MEXC BUY failed: {e}")
+            return "LIVE BUY failed", 500
+
+entry_price = price
         in_position = True
         last_action_ts = time.time()
         entry_ts = time.time()
@@ -728,7 +820,24 @@ def webhook():
             _dbg("sell guard: invalid entry_price")
             return "No valid entry", 400
 
-        verkoop_bedrag = price * START_CAPITAL / entry_price
+            # --- LIVE SELL on MEXC (optional) ---
+    if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+        try:
+            ex = _mexc_live()
+            amt = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
+            if amt > 0:
+                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                avg = order.get("average") or order.get("price") or price
+                price = float(avg)   # gebruik daadwerkelijke exit-prijs
+                _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={order.get('filled')} avg={price}")
+            else:
+                _dbg("[LIVE] MEXC SELL skipped: pos_amount=0")
+        except Exception as e:
+            _dbg(f"[LIVE] MEXC SELL failed: {e}")
+            return "LIVE SELL failed", 500
+    pos_amount = 0.0
+
+verkoop_bedrag = price * START_CAPITAL / entry_price
         winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
         _dbg(f"SELL calc -> price={price} entry={entry_price} pnl={winst_bedrag}")
 
@@ -835,6 +944,8 @@ def config_view():
     )
 
     payload = {
+        "live_exchange": LIVE_EXCHANGE,
+        "mexc_keys_set": bool(os.getenv("MEXC_API_KEY") and os.getenv("MEXC_API_SECRET")),
         "symbol": SYMBOL_STR,
         "timeframe_default": "1m",
         "live_mode": LIVE_MODE,
