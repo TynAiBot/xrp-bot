@@ -961,7 +961,6 @@ def webhook():
     _dbg("unknown path fallthrough")
     return "OK", 200
 
-
 # -----------------------
 # Safety / forced exits
 # -----------------------
@@ -990,7 +989,6 @@ def _do_forced_sell(
                 price = float(avg)   # exitprijs = echte fill
                 # pas snapshot aan op daadwerkelijke fill (defensief bij partial)
                 if filled > 0:
-                    # schaal inleg mee naar verhouding van filled
                     if amt_before > 0 and filled < amt_before:
                         quote_before = quote_before * (filled / amt_before)
                     amt_before = filled
@@ -1000,7 +998,6 @@ def _do_forced_sell(
         except Exception as e:
             _dbg(f"[LIVE] MEXC FORCED SELL failed: {e}")
             # we gaan door met lokale afwikkeling o.b.v. snapshot
-            # (price is dan de meegegeven prijs)
 
     # PnL berekenen:
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
@@ -1057,7 +1054,6 @@ def _do_forced_sell(
     )
     log_trade("sell", price, winst_bedrag, source, tf)
     return True
-
 
 
 def forced_exit_check(last_price: float | None = None):
