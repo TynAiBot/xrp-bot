@@ -769,7 +769,7 @@ def is_duplicate_signal(action: str, source: str, price: float, tf: str) -> bool
 # -------------- Webhook --------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global in_position, entry_price, capital, sparen, last_action_ts, entry_ts, tpsl_state, pos_amount
+    global in_position, entry_price, capital, sparen, last_action_ts, entry_ts, tpsl_state, pos_amount, pos_quote
 
     # Secret
     if WEBHOOK_SECRET:
@@ -862,8 +862,8 @@ def webhook():
         # ------------------------------------
 
         # State
-        entry_price   = price
-        in_position   = True
+        entry_price    = price
+        in_position    = True
         last_action_ts = time.time()
         entry_ts       = time.time()
         _dbg(f"BUY executed: entry={entry_price}")
@@ -889,11 +889,21 @@ def webhook():
 
         log_trade("buy", price, 0.0, source, tf)
         return "OK", 200
-
     
     # === SELL ===
     if action == "sell":
-        # geen positie? alleen doorgaan als we live op MEXC écht size hebben
+        # niet in positie? probeer lazy rehydrate voor LIVE MEXC
+        if not in_position:
+            did = False
+            if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+                try:
+                    did = _rehydrate_from_mexc()  # bestaat in jouw code; anders slaat try/except over
+                    _dbg(f"[REHYDRATE] lazy attempt result={did} in_position={in_position} pos_amount={pos_amount}")
+                except NameError:
+                    _dbg("[REHYDRATE] function not present; skipping")
+                except Exception as e:
+                    _dbg(f"[REHYDRATE] lazy failed: {e}")
+        # als we nog steeds niets hebben, en er is ook geen echte live size -> terug
         if not in_position and not (LIVE_MODE and LIVE_EXCHANGE == "mexc" and pos_amount > 1e-12):
             _dbg("sell ignored: not in_position")
             return "OK", 200
@@ -903,7 +913,7 @@ def webhook():
 
         # --- LIVE SELL op MEXC (indien actief) ---
         amt_for_pnl = float(pos_amount)
-        inleg_quote = float(pos_quote)
+        inleg_quote = float(pos_quote or 0.0)   # defensief inlezen
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
             try:
                 ex = _mexc_live()
@@ -920,9 +930,13 @@ def webhook():
                     _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={filled} avg={price}")
                 else:
                     _dbg("[LIVE] MEXC SELL skipped: pos_amount=0")
+                    return "OK", 200
             except Exception as e:
                 _dbg(f"[LIVE] MEXC SELL failed: {e}")
+                return "LIVE SELL failed", 500
         # ------------------------------------------
+
+        _dbg(f"[SELLDBG] amt_for_pnl={amt_for_pnl}, inleg_quote={inleg_quote}, fill={price}")
 
         # PnL & boeking
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
@@ -965,11 +979,12 @@ def webhook():
 
         # TG: toon TV-prijs én MEXC-fill (met delta)
         display_fill = price if (LIVE_MODE and LIVE_EXCHANGE == "mexc") else tv_sell
+        delta_txt = f"  (Δ {(display_fill / tv_sell - 1) * 100:+.2f}%)" if tv_sell else ""
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
         send_tg(
             f"""📄 <b>[XRP/USDT] VERKOOP</b>
 📹 TV prijs: ${tv_sell:.4f}
-🎯 Fill (MEXC): ${display_fill:.4f}{(f"  (Δ {(display_fill/tv_sell-1)*100:+.2f}%)" if tv_sell else "")}
+🎯 Fill (MEXC): ${display_fill:.4f}{delta_txt}
 🧠 Signaalbron: {source} | {advisor_reason}
 🕒 TF: {tf}
 💰 Handelssaldo: €{capital:.2f}
