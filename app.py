@@ -821,7 +821,7 @@ def webhook():
             entry_price = 0.0
             pos_amount = 0.0
     pos_quote  = 0.0
-            tpsl_reset()
+    tpsl_reset()
 
     timestamp = now_str()
 
@@ -872,56 +872,58 @@ def webhook():
         log_trade("buy", price, 0.0, source, tf)
         return "OK", 200
 
-    # === SELL ===
+        # === SELL ===
     if action == "sell":
-        if not in_position:
+        # geen positie? alleen doorgaan als we live op MEXC écht size hebben
+        if not in_position and not (LIVE_MODE and LIVE_EXCHANGE == "mexc" and pos_amount > 1e-12):
             _dbg("sell ignored: not in_position")
-            if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-                try:
-                    if _rehydrate_from_mexc():
-                        _dbg("[REHYDRATE] success; continuing SELL flow")
-                    else:
-                        _dbg("[REHYDRATE] no live position found")
-                except Exception as e:
-                    _dbg(f"[REHYDRATE] lazy failed: {e}")
-            if not in_position:
-                return "OK", 200
+            return "OK", 200
 
-        # LIVE SELL (MEXC)
+        tv_sell = price  # TV payload prijs (optioneel voor TG/diagnose)
+
+        # --- LIVE SELL op MEXC (indien actief) ---
+        amt_for_pnl = float(pos_amount)
+        inleg_quote = float(pos_quote)
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
             try:
                 ex = _mexc_live()
-                amt = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
-                if amt > 0:
-                    order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                amt_req = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
+                if amt_req > 0:
+                    order = ex.create_order(SYMBOL_TV, "market", "sell", amt_req)
                     avg = order.get("average") or order.get("price") or price
-                    price = float(avg)
-                    _dbg(
-                        f"[LIVE] MEXC SELL id={order.get('id')} filled={order.get('filled')} avg={price}"
-                    )
+                    filled = float(order.get("filled") or amt_req)
+                    price = float(avg)  # gebruik echte exit-fill
+                    # partial fill → schaal inleg mee
+                    if pos_amount > 0 and filled < pos_amount:
+                        inleg_quote = inleg_quote * (filled / pos_amount)
+                    amt_for_pnl = filled
+                    _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={filled} avg={price}")
                 else:
                     _dbg("[LIVE] MEXC SELL skipped: pos_amount=0")
             except Exception as e:
                 _dbg(f"[LIVE] MEXC SELL failed: {e}")
-                return "LIVE SELL failed", 500
-        pos_amount = 0.0
-    pos_quote  = 0.0
+        # ------------------------------------------
 
         # PnL & boeking
-        if entry_price > 0:
-            verkoop_bedrag = price * START_CAPITAL / entry_price
-            winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
+        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+            verkoop_bedrag = price * amt_for_pnl
+            inleg = inleg_quote
+            winst_bedrag = round(verkoop_bedrag - inleg, 2)
         else:
-            _dbg("[SELL] missing entry_price; booking pnl=0 fallback")
-            winst_bedrag = 0.0
+            if entry_price > 0:
+                verkoop_bedrag = price * START_CAPITAL / entry_price
+                winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
+            else:
+                _dbg("[SELL] missing entry_price; booking pnl=0 fallback")
+                winst_bedrag = 0.0
 
         _dbg(f"SELL calc -> price={price} entry={entry_price} pnl={winst_bedrag}")
 
         if winst_bedrag > 0:
-            sparen += SAVINGS_SPLIT * winst_bedrag
+            sparen  += SAVINGS_SPLIT * winst_bedrag
             capital += (1.0 - SAVINGS_SPLIT) * winst_bedrag
         else:
-            capital += winst_bedrag
+            capital += winst_bedrag  # verlies ten laste van trading-kapitaal
 
         # top-up naar START_CAPITAL
         if capital < START_CAPITAL:
@@ -930,19 +932,18 @@ def webhook():
                 sparen -= tekort
                 capital += tekort
 
-        in_position = False
-        entry_price = 0.0
+        # reset state (na berekening!)
+        in_position   = False
+        entry_price   = 0.0
+        pos_amount    = 0.0
+        pos_quote     = 0.0
         last_action_ts = time.time()
-
-        resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
-        _dbg(
-            f"SELL executed -> {resultaat}={winst_bedrag}, capital={capital}, sparen={sparen}"
-        )
 
         if LOCAL_TPSL_ENABLED:
             tpsl_reset()
             _dbg("[TPSL] reset on SELL")
 
+        resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
         send_tg(
             f"""📄 <b>[XRP/USDT] VERKOOP</b>
 📹 Verkoopprijs: ${price:.4f}
@@ -958,8 +959,6 @@ def webhook():
         log_trade("sell", price, winst_bedrag, source, tf)
         return "OK", 200
 
-    _dbg("unknown path fallthrough")
-    return "OK", 200
 
 # -----------------------
 # Safety / forced exits
