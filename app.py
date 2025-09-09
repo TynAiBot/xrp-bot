@@ -124,7 +124,7 @@ if not TG_TOKEN or not TG_CHAT_ID:
     raise SystemExit("[FOUT] TELEGRAM_BOT_TOKEN of TELEGRAM_CHAT_ID ontbreekt.")
 
 # Trend client (alleen als filter aan staat)
-trend_exchange = ccxt.binance({"enableRateLimit": True}) if USE_TREND_FILTER else None
+trend_exchange = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "spot"}}) if USE_TREND_FILTER else None
 
 # Debug helper
 DEBUG_SIG = env_bool("DEBUG_SIG", True)
@@ -532,9 +532,12 @@ def _client(name: str):
 
 
 def _sources_order():
-    src = EXCHANGE_SOURCE
+    src = EXCHANGE_SOURCE.lower()
+    if src == "mexc":
+        return ["mexc"]
     if src == "auto":
-        return ["mexc", "binance", "bybit", "okx"]
+        # desnoods: eerst MEXC, dan optioneel bybit/okx; laat binance eruit
+        return ["mexc", "bybit", "okx"]
     return [src]
 
 
