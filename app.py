@@ -144,12 +144,10 @@ in_position = False
 entry_price = 0.0
 entry_ts = 0.0
 last_action_ts = 0.0
-
 capital = START_CAPITAL
 sparen = SPAREN_START
-
 pos_amount = 0.0
-    pos_quote  = 0.0  # actuele hoeveelheid XRP bij live trading
+pos_quote = 0.0  # werkelijk besteed USDT (quote) bij live BUY
 
 last_signal_key_ts = {}  # (action, source, round(price,4), tf) -> ts
 
@@ -971,52 +969,78 @@ def _do_forced_sell(
     price: float, reason: str, source: str = "forced_exit", tf: str = "1m"
 ) -> bool:
     global in_position, entry_price, capital, sparen, last_action_ts, pos_amount, pos_quote
-    if not in_position or entry_price <= 0:
+
+    # Laat forced sell toe als we in positie zijn OF (live op MEXC en er is echt size)
+    if not in_position and not (LIVE_MODE and LIVE_EXCHANGE == "mexc" and pos_amount > 1e-12):
         return False
+
+    # Snapshot vóór we iets wijzigen (belangrijk voor PnL)
+    amt_before = float(pos_amount)
+    quote_before = float(pos_quote)
 
     # LIVE exit (MEXC)
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
         try:
             ex = _mexc_live()
-            amt = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
-            if amt > 0:
-                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+            amt_req = float(ex.amount_to_precision(SYMBOL_TV, amt_before))
+            if amt_req > 0:
+                order = ex.create_order(SYMBOL_TV, "market", "sell", amt_req)
                 avg = order.get("average") or order.get("price") or price
-                price = float(avg)
-                _dbg(
-                    f"[LIVE] MEXC FORCED SELL id={order.get('id')} filled={order.get('filled')} avg={price}"
-                )
+                filled = float(order.get("filled") or amt_req)
+                price = float(avg)   # exitprijs = echte fill
+                # pas snapshot aan op daadwerkelijke fill (defensief bij partial)
+                if filled > 0:
+                    # schaal inleg mee naar verhouding van filled
+                    if amt_before > 0 and filled < amt_before:
+                        quote_before = quote_before * (filled / amt_before)
+                    amt_before = filled
+                _dbg(f"[LIVE] MEXC FORCED SELL id={order.get('id')} filled={filled} avg={price}")
             else:
                 _dbg("[LIVE] forced sell skipped: pos_amount=0")
         except Exception as e:
             _dbg(f"[LIVE] MEXC FORCED SELL failed: {e}")
-        pos_amount = 0.0
-    pos_quote  = 0.0
+            # we gaan door met lokale afwikkeling o.b.v. snapshot
+            # (price is dan de meegegeven prijs)
 
+    # PnL berekenen:
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-        verkoop_bedrag = float(price) * float(pos_amount)
-        inleg = float(pos_quote)
+        verkoop_bedrag = float(price) * float(amt_before)
+        inleg = float(quote_before)
     else:
-        verkoop_bedrag = price * START_CAPITAL / entry_price
-        inleg = START_CAPITAL
+        # Simulatiepad (of geen live): val terug op START_CAPITAL/entry
+        if entry_price > 0:
+            verkoop_bedrag = price * START_CAPITAL / entry_price
+            inleg = START_CAPITAL
+        else:
+            # Als entry onbekend is, boek geen PnL (defensief)
+            verkoop_bedrag = START_CAPITAL
+            inleg = START_CAPITAL
+
     winst_bedrag = round(verkoop_bedrag - inleg, 2)
 
+    # Boekhouding
     if winst_bedrag > 0:
-        sparen += SAVINGS_SPLIT * winst_bedrag
+        sparen  += SAVINGS_SPLIT * winst_bedrag
         capital += (1.0 - SAVINGS_SPLIT) * winst_bedrag
     else:
-        capital += winst_bedrag
+        capital += winst_bedrag  # verlies ten laste van trading-kapitaal
 
+    # Top-up terug naar START_CAPITAL
     if capital < START_CAPITAL:
         tekort = START_CAPITAL - capital
         if sparen >= tekort:
             sparen -= tekort
             capital += tekort
 
+    # State reset (pas NA berekening)
     in_position = False
     entry_price = 0.0
+    pos_amount  = 0.0
+    pos_quote   = 0.0
     last_action_ts = time.time()
+    tpsl_reset()
 
+    # TG + log
     resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
     timestamp = now_str()
     send_tg(
@@ -1033,6 +1057,7 @@ def _do_forced_sell(
     )
     log_trade("sell", price, winst_bedrag, source, tf)
     return True
+
 
 
 def forced_exit_check(last_price: float | None = None):
