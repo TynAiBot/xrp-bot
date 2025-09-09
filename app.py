@@ -148,7 +148,8 @@ last_action_ts = 0.0
 capital = START_CAPITAL
 sparen = SPAREN_START
 
-pos_amount = 0.0  # actuele hoeveelheid XRP bij live trading
+pos_amount = 0.0
+    pos_quote  = 0.0  # actuele hoeveelheid XRP bij live trading
 
 last_signal_key_ts = {}  # (action, source, round(price,4), tf) -> ts
 
@@ -821,6 +822,7 @@ def webhook():
             in_position = False
             entry_price = 0.0
             pos_amount = 0.0
+    pos_quote  = 0.0
             tpsl_reset()
 
     timestamp = now_str()
@@ -905,6 +907,7 @@ def webhook():
                 _dbg(f"[LIVE] MEXC SELL failed: {e}")
                 return "LIVE SELL failed", 500
         pos_amount = 0.0
+    pos_quote  = 0.0
 
         # PnL & boeking
         if entry_price > 0:
@@ -967,7 +970,7 @@ def webhook():
 def _do_forced_sell(
     price: float, reason: str, source: str = "forced_exit", tf: str = "1m"
 ) -> bool:
-    global in_position, entry_price, capital, sparen, last_action_ts, pos_amount
+    global in_position, entry_price, capital, sparen, last_action_ts, pos_amount, pos_quote
     if not in_position or entry_price <= 0:
         return False
 
@@ -988,9 +991,15 @@ def _do_forced_sell(
         except Exception as e:
             _dbg(f"[LIVE] MEXC FORCED SELL failed: {e}")
         pos_amount = 0.0
+    pos_quote  = 0.0
 
-    verkoop_bedrag = price * START_CAPITAL / entry_price
-    winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
+    if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+        verkoop_bedrag = float(price) * float(pos_amount)
+        inleg = float(pos_quote)
+    else:
+        verkoop_bedrag = price * START_CAPITAL / entry_price
+        inleg = START_CAPITAL
+    winst_bedrag = round(verkoop_bedrag - inleg, 2)
 
     if winst_bedrag > 0:
         sparen += SAVINGS_SPLIT * winst_bedrag
@@ -1074,6 +1083,8 @@ def report_daily():
             "totaalwaarde": round(capital + sparen, 2),
             "in_position": in_position,
             "entry_price": round(entry_price, 4),
+            "pos_amount": pos_amount,
+            "pos_quote": pos_quote,
             "laatste_actie": (
                 datetime.fromtimestamp(last_action_ts).strftime("%d-%m-%Y %H:%M:%S")
                 if last_action_ts > 0
@@ -1150,6 +1161,8 @@ def config_view():
         # runtime
         "in_position": in_position,
         "entry_price": round(entry_price, 4),
+            "pos_amount": pos_amount,
+            "pos_quote": pos_quote,
         "capital": round(capital, 2),
         "sparen": round(sparen, 2),
         "totaalwaarde": round(capital + sparen, 2),
