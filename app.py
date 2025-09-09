@@ -823,20 +823,17 @@ def webhook():
     # --- Ghost-position guard (alleen LIVE MEXC) ---
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
         if in_position and (pos_amount <= 1e-12 or entry_price <= 0):
-            _dbg(
-                "[GUARD] fix ghost position: clearing in_position due to zero size/entry (LIVE)"
-            )
+            _dbg(f"[GUARD] ghost detected: in_position={in_position}, pos_amount={pos_amount}, entry_price={entry_price}")
             in_position = False
             entry_price = 0.0
-            pos_amount = 0.0
-    pos_quote  = 0.0
-    tpsl_reset()
+            pos_amount  = 0.0
+            pos_quote   = 0.0
+            tpsl_reset()
 
     timestamp = now_str()
 
     # === BUY ===
     if action == "buy":
-
         if in_position:
             _dbg(f"buy ignored: already in_position at entry={entry_price}")
             return "OK", 200
@@ -847,32 +844,40 @@ def webhook():
             _dbg("blocked by trend filter")
             return "OK", 200
 
-        # LIVE BUY (MEXC)
+        # Bewaar TV-entry prijs voor TG (we gaan 'price' zo mogelijk overschrijven met fill)
+        tv_entry = tv_price
+
+        # --- LIVE BUY op MEXC ---
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
             try:
                 avg, filled, order = _place_mexc_market("buy", START_CAPITAL, price)
-                price = float(avg)  # echte fill
-                pos_amount = float(filled)  # gekochte hoeveelheid
-                _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg}")
+                price = float(avg)           # echte fill als entry
+                pos_amount = float(filled)   # aantal XRP gekocht
+                cost = order.get("cost")
+                pos_quote = float(cost) if cost is not None else float(avg) * float(filled)  # werkelijk besteed USDT
+                _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg} cost={pos_quote}")
             except Exception as e:
                 _dbg(f"[LIVE] MEXC BUY failed: {e}")
                 return "LIVE BUY failed", 500
+        # ------------------------------------
 
-        entry_price = price
-        in_position = True
+        # State
+        entry_price   = price
+        in_position   = True
         last_action_ts = time.time()
-        entry_ts = time.time()
+        entry_ts       = time.time()
         _dbg(f"BUY executed: entry={entry_price}")
 
-        # Arm lokale TPSL (Optie 3) — let op: 'price' is hier de entry (bij LIVE = MEXC fill)
+        # Arm lokale TPSL (Optie 3) — gebruikt de entry (bij LIVE = MEXC fill)
         tpsl_on_buy(price)
 
-        # TG met TV-prijs en echte fill (MEXC)
-        display_fill = price if (LIVE_MODE and LIVE_EXCHANGE == "mexc") else tv_price
+        # TG met TV-prijs + MEXC fill (incl. delta als tv_entry > 0)
+        display_fill = price if (LIVE_MODE and LIVE_EXCHANGE == "mexc") else tv_entry
+        delta_txt = f"  (Δ {(display_fill / tv_entry - 1) * 100:+.2f}%)" if tv_entry else ""
         send_tg(
             f"""🟢 <b>[XRP/USDT] AANKOOP</b>
-📹 TV prijs: ${tv_price:.4f}
-🎯 Fill (MEXC): ${display_fill:.4f}{(f"  (Δ {(display_fill/tv_price-1)*100:+.2f}%)" if tv_price else "")}
+📹 TV prijs: ${tv_entry:.4f}
+🎯 Fill (MEXC): ${display_fill:.4f}{delta_txt}
 🧠 Signaalbron: {source} | {advisor_reason}
 🕒 TF: {tf}
 💰 Handelssaldo: €{capital:.2f}
@@ -881,8 +886,10 @@ def webhook():
 🔐 Tradebedrag: €{START_CAPITAL:.2f}
 🔗 Tijd: {timestamp}"""
         )
+
         log_trade("buy", price, 0.0, source, tf)
         return "OK", 200
+
     
     # === SELL ===
     if action == "sell":
