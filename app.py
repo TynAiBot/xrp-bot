@@ -793,6 +793,12 @@ def webhook():
     if price <= 0 or action not in ("buy", "sell"):
         _dbg("bad payload guard (price<=0 of action niet buy/sell)")
         return "Bad payload", 400
+    
+    tv_price  = float(data.get("price", 0) or 0.0)
+    tv_symbol = str(data.get("tv_symbol", "")).upper()
+    if LIVE_EXCHANGE == "mexc" and tv_symbol and not tv_symbol.startswith("MEXC:XRPUSDT"):
+        _dbg(f"[TVGUARD] ignored non-MEXC alert tv_symbol={tv_symbol}")
+        return "OK", 200
 
     # De-dup & cooldown
     if is_duplicate_signal(action, source, price, tf):
@@ -858,12 +864,15 @@ def webhook():
         entry_ts = time.time()
         _dbg(f"BUY executed: entry={entry_price}")
 
-        # Arm lokale TPSL (Optie 3)
+        # Arm lokale TPSL (Optie 3) — let op: 'price' is hier de entry (bij LIVE = MEXC fill)
         tpsl_on_buy(price)
 
+        # TG met TV-prijs en echte fill (MEXC)
+        display_fill = price if (LIVE_MODE and LIVE_EXCHANGE == "mexc") else tv_price
         send_tg(
             f"""🟢 <b>[XRP/USDT] AANKOOP</b>
-📹 Koopprijs: ${price:.4f}
+📹 TV prijs: ${tv_price:.4f}
+🎯 Fill (MEXC): ${display_fill:.4f}{(f"  (Δ {(display_fill/tv_price-1)*100:+.2f}%)" if tv_price else "")}
 🧠 Signaalbron: {source} | {advisor_reason}
 🕒 TF: {tf}
 💰 Handelssaldo: €{capital:.2f}
@@ -874,15 +883,16 @@ def webhook():
         )
         log_trade("buy", price, 0.0, source, tf)
         return "OK", 200
-
-        # === SELL ===
+    
+    # === SELL ===
     if action == "sell":
         # geen positie? alleen doorgaan als we live op MEXC écht size hebben
         if not in_position and not (LIVE_MODE and LIVE_EXCHANGE == "mexc" and pos_amount > 1e-12):
             _dbg("sell ignored: not in_position")
             return "OK", 200
 
-        tv_sell = price  # TV payload prijs (optioneel voor TG/diagnose)
+        # Bewaar TV-verkoopprijs vóór we 'price' vervangen door MEXC fill
+        tv_sell = tv_price
 
         # --- LIVE SELL op MEXC (indien actief) ---
         amt_for_pnl = float(pos_amount)
@@ -936,20 +946,23 @@ def webhook():
                 capital += tekort
 
         # reset state (na berekening!)
-        in_position   = False
-        entry_price   = 0.0
-        pos_amount    = 0.0
-        pos_quote     = 0.0
+        in_position    = False
+        entry_price    = 0.0
+        pos_amount     = 0.0
+        pos_quote      = 0.0
         last_action_ts = time.time()
 
         if LOCAL_TPSL_ENABLED:
             tpsl_reset()
             _dbg("[TPSL] reset on SELL")
 
+        # TG: toon TV-prijs én MEXC-fill (met delta)
+        display_fill = price if (LIVE_MODE and LIVE_EXCHANGE == "mexc") else tv_sell
         resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
         send_tg(
             f"""📄 <b>[XRP/USDT] VERKOOP</b>
-📹 Verkoopprijs: ${price:.4f}
+📹 TV prijs: ${tv_sell:.4f}
+🎯 Fill (MEXC): ${display_fill:.4f}{(f"  (Δ {(display_fill/tv_sell-1)*100:+.2f}%)" if tv_sell else "")}
 🧠 Signaalbron: {source} | {advisor_reason}
 🕒 TF: {tf}
 💰 Handelssaldo: €{capital:.2f}
@@ -961,7 +974,6 @@ def webhook():
         )
         log_trade("sell", price, winst_bedrag, source, tf)
         return "OK", 200
-
 
 # -----------------------
 # Safety / forced exits
