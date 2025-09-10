@@ -102,6 +102,8 @@ ADVISOR_SECRET = os.getenv("ADVISOR_SECRET", "")
 # Lokale TPSL monitor
 LOCAL_TPSL_ENABLED = env_bool("LOCAL_TPSL_ENABLED", True)
 SYNC_TPSL_FROM_ADVISOR = env_bool("SYNC_TPSL_FROM_ADVISOR", True)
+SELL_RETRY_RATIO   = env_float("SELL_RETRY_RATIO", 0.995)  # 2e poging bij oversold: % van free
+SELL_EPSILON_TICKS = env_int("SELL_EPSILON_TICKS", 1)      # # ticks onder hoeveelheid-precision
 
 # Defaults (gebruikt als SYNC_TPSL_FROM_ADVISOR=False of advisor niet bereikbaar)
 LOCAL_TP_PCT = env_float("LOCAL_TP_PCT", 0.010)
@@ -911,26 +913,30 @@ def webhook():
         # Bewaar TV-verkoopprijs vóór we 'price' vervangen door MEXC fill
         tv_sell = tv_price
 
-        # --- LIVE SELL op MEXC (robust tegen 'Oversold') ---
+        # --- LIVE SELL op MEXC (robust + .env tuning) ---
         amt_for_pnl = float(pos_amount)
-        inleg_quote  = float(pos_quote or 0.0)
+        inleg_quote  = float(pos_quote or 0.0) if 'pos_quote' in globals() or 'pos_quote' in locals() else 0.0
+
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+            ex   = None
+            base = "XRP"
             try:
                 ex   = _mexc_live()
                 m    = ex.market(SYMBOL_TV)
                 base = m.get("base") or "XRP"
 
-                # Vrije hoeveelheid XRP ophalen
+                # Vrije hoeveelheid XRP
                 bal       = ex.fetch_balance()
                 free_amt  = float((bal.get(base) or {}).get("free") or 0.0)
 
-                # Wat we willen verkopen vs wat vrij is
+                # Gewenst vs vrij
                 wanted = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
                 amt    = min(wanted, free_amt)
 
-                # Epsilon onder de hoeveelheid-precision
+                # Epsilon onder hoeveelheid-precision (via .env ticks)
                 prec    = int((m.get("precision") or {}).get("amount") or 6)
-                epsilon = 10 ** (-prec)
+                ticks   = max(1, int(SELL_EPSILON_TICKS))
+                epsilon = (10 ** (-prec)) * ticks
                 amt     = max(0.0, amt - epsilon)
                 amt     = float(ex.amount_to_precision(SYMBOL_TV, amt))
 
@@ -943,33 +949,37 @@ def webhook():
                 filled = float(order.get("filled") or amt)
                 price  = float(avg)
 
-                # Partial fill → schaal je inleg (pos_quote) naar verhouding
-                if pos_amount > 0 and filled < pos_amount:
-                    inleg_quote = inleg_quote * (filled / pos_amount)
-                amt_for_pnl = filled
+                # Partial fill → schaal quote-inleg voor PnL
+                if 'pos_quote' in globals() or 'pos_quote' in locals():
+                    if pos_amount > 0 and filled < pos_amount:
+                        inleg_quote = inleg_quote * (filled / pos_amount)
 
+                amt_for_pnl = filled
                 _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={filled} avg={price} amt={amt}")
 
             except Exception as e:
                 msg = str(e)
                 _dbg(f"[LIVE] MEXC SELL error: {msg}")
 
-                # Specifieke 'Oversold/Insufficient' handling → 1 retry ~99.5% van free
+                # Specifiek 'Oversold/Insufficient' → 1 retry met .env ratio
                 if "Oversold" in msg or "30005" in msg or "Insufficient" in msg:
                     try:
-                        bal       = ex.fetch_balance()
+                        ex  = ex or _mexc_live()
+                        bal = ex.fetch_balance()
                         free_amt  = float((bal.get(base) or {}).get("free") or 0.0)
-                        retry_amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, free_amt * 0.995)))
+                        ratio     = float(SELL_RETRY_RATIO or 0.995)
+                        retry_amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, free_amt * ratio)))
+
                         if retry_amt > 0:
                             order  = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
                             avg    = order.get("average") or order.get("price") or price
                             filled = float(order.get("filled") or retry_amt)
                             price  = float(avg)
 
-                            if pos_amount > 0 and filled < pos_amount:
+                            if ('pos_quote' in globals() or 'pos_quote' in locals()) and pos_amount > 0 and filled < pos_amount:
                                 inleg_quote = inleg_quote * (filled / pos_amount)
-                            amt_for_pnl = filled
 
+                            amt_for_pnl = filled
                             _dbg(f"[LIVE] MEXC SELL RETRY ok id={order.get('id')} filled={filled} avg={price} amt={retry_amt}")
                         else:
                             _dbg("[LIVE] RETRY skipped: retry_amt<=0")
@@ -978,11 +988,11 @@ def webhook():
                         _dbg(f"[LIVE] RETRY failed: {e2}")
                         return "OK", 200
                 else:
-                    # Andere fout → niet lokaal afsluiten; geen 500 terug naar TV
+                    # Andere fout → geen 500 naar TV; laat webhook door
                     return "OK", 200
-        # ------------------------------------------
+        # ----------------------------------------------
 
-        # ------------------------------------------
+
 
         _dbg(f"[SELLDBG] amt_for_pnl={amt_for_pnl}, inleg_quote={inleg_quote}, fill={price}")
 
@@ -1118,8 +1128,6 @@ def _do_forced_sell(
                     _dbg(f"[LIVE] FORCED RETRY failed: {e2}")
                     return False
 
-
-    
 
     # PnL berekenen:
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
@@ -1297,6 +1305,8 @@ def config_view():
         "telegram_config_ok": bool(TG_TOKEN and TG_CHAT_ID),
         "trades_file": TRADES_FILE,
         # safety
+        "sell_retry_ratio": SELL_RETRY_RATIO,
+        "sell_epsilon_ticks": SELL_EPSILON_TICKS,
         "hard_sl_pct": round(HARD_SL_PCT, 6),
         "hard_sl_arm_sec": int(HARD_SL_ARM_SEC),
         "max_hold_min": int(MAX_HOLD_MIN),
