@@ -911,29 +911,77 @@ def webhook():
         # Bewaar TV-verkoopprijs vóór we 'price' vervangen door MEXC fill
         tv_sell = tv_price
 
-        # --- LIVE SELL op MEXC (indien actief) ---
+        # --- LIVE SELL op MEXC (robust tegen 'Oversold') ---
         amt_for_pnl = float(pos_amount)
-        inleg_quote = float(pos_quote or 0.0)   # defensief inlezen
+        inleg_quote  = float(pos_quote or 0.0)
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
             try:
-                ex = _mexc_live()
-                amt_req = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
-                if amt_req > 0:
-                    order = ex.create_order(SYMBOL_TV, "market", "sell", amt_req)
-                    avg = order.get("average") or order.get("price") or price
-                    filled = float(order.get("filled") or amt_req)
-                    price = float(avg)  # gebruik echte exit-fill
-                    # partial fill → schaal inleg mee
-                    if pos_amount > 0 and filled < pos_amount:
-                        inleg_quote = inleg_quote * (filled / pos_amount)
-                    amt_for_pnl = filled
-                    _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={filled} avg={price}")
-                else:
-                    _dbg("[LIVE] MEXC SELL skipped: pos_amount=0")
+                ex   = _mexc_live()
+                m    = ex.market(SYMBOL_TV)
+                base = m.get("base") or "XRP"
+
+                # Vrije hoeveelheid XRP ophalen
+                bal       = ex.fetch_balance()
+                free_amt  = float((bal.get(base) or {}).get("free") or 0.0)
+
+                # Wat we willen verkopen vs wat vrij is
+                wanted = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
+                amt    = min(wanted, free_amt)
+
+                # Epsilon onder de hoeveelheid-precision
+                prec    = int((m.get("precision") or {}).get("amount") or 6)
+                epsilon = 10 ** (-prec)
+                amt     = max(0.0, amt - epsilon)
+                amt     = float(ex.amount_to_precision(SYMBOL_TV, amt))
+
+                if amt <= 0:
+                    _dbg(f"[LIVE] MEXC SELL skipped: amt<=0 (pos_amount={pos_amount}, free={free_amt})")
                     return "OK", 200
+
+                order  = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                avg    = order.get("average") or order.get("price") or price
+                filled = float(order.get("filled") or amt)
+                price  = float(avg)
+
+                # Partial fill → schaal je inleg (pos_quote) naar verhouding
+                if pos_amount > 0 and filled < pos_amount:
+                    inleg_quote = inleg_quote * (filled / pos_amount)
+                amt_for_pnl = filled
+
+                _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={filled} avg={price} amt={amt}")
+
             except Exception as e:
-                _dbg(f"[LIVE] MEXC SELL failed: {e}")
-                return "LIVE SELL failed", 500
+                msg = str(e)
+                _dbg(f"[LIVE] MEXC SELL error: {msg}")
+
+                # Specifieke 'Oversold/Insufficient' handling → 1 retry ~99.5% van free
+                if "Oversold" in msg or "30005" in msg or "Insufficient" in msg:
+                    try:
+                        bal       = ex.fetch_balance()
+                        free_amt  = float((bal.get(base) or {}).get("free") or 0.0)
+                        retry_amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, free_amt * 0.995)))
+                        if retry_amt > 0:
+                            order  = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
+                            avg    = order.get("average") or order.get("price") or price
+                            filled = float(order.get("filled") or retry_amt)
+                            price  = float(avg)
+
+                            if pos_amount > 0 and filled < pos_amount:
+                                inleg_quote = inleg_quote * (filled / pos_amount)
+                            amt_for_pnl = filled
+
+                            _dbg(f"[LIVE] MEXC SELL RETRY ok id={order.get('id')} filled={filled} avg={price} amt={retry_amt}")
+                        else:
+                            _dbg("[LIVE] RETRY skipped: retry_amt<=0")
+                            return "OK", 200
+                    except Exception as e2:
+                        _dbg(f"[LIVE] RETRY failed: {e2}")
+                        return "OK", 200
+                else:
+                    # Andere fout → niet lokaal afsluiten; geen 500 terug naar TV
+                    return "OK", 200
+        # ------------------------------------------
+
         # ------------------------------------------
 
         _dbg(f"[SELLDBG] amt_for_pnl={amt_for_pnl}, inleg_quote={inleg_quote}, fill={price}")
@@ -1013,27 +1061,65 @@ def _do_forced_sell(
     amt_before = float(pos_amount)
     quote_before = float(pos_quote)
 
-    # LIVE exit (MEXC)
+    # LIVE exit (MEXC) - robust tegen 'Oversold'
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
         try:
-            ex = _mexc_live()
-            amt_req = float(ex.amount_to_precision(SYMBOL_TV, amt_before))
-            if amt_req > 0:
-                order = ex.create_order(SYMBOL_TV, "market", "sell", amt_req)
-                avg = order.get("average") or order.get("price") or price
-                filled = float(order.get("filled") or amt_req)
-                price = float(avg)   # exitprijs = echte fill
-                # pas snapshot aan op daadwerkelijke fill (defensief bij partial)
-                if filled > 0:
-                    if amt_before > 0 and filled < amt_before:
-                        quote_before = quote_before * (filled / amt_before)
-                    amt_before = filled
+            ex   = _mexc_live()
+            m    = ex.market(SYMBOL_TV)
+            base = m.get("base") or "XRP"
+
+            bal      = ex.fetch_balance()
+            free_amt = float((bal.get(base) or {}).get("free") or 0.0)
+
+            wanted = float(ex.amount_to_precision(SYMBOL_TV, amt_before))
+            amt    = min(wanted, free_amt)
+            prec    = int((m.get("precision") or {}).get("amount") or 6)
+            epsilon = 10 ** (-prec)
+            amt     = max(0.0, amt - epsilon)
+            amt     = float(ex.amount_to_precision(SYMBOL_TV, amt))
+
+            if amt > 0:
+                order  = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                avg    = order.get("average") or order.get("price") or price
+                filled = float(order.get("filled") or amt)
+                price  = float(avg)
+
+                # Partial fill → schaal quote-inleg + amt voor PnL
+                if amt_before > 0 and filled < amt_before:
+                    quote_before = quote_before * (filled / amt_before)
+                amt_before = filled
+
                 _dbg(f"[LIVE] MEXC FORCED SELL id={order.get('id')} filled={filled} avg={price}")
             else:
-                _dbg("[LIVE] forced sell skipped: pos_amount=0")
+                _dbg("[LIVE] forced sell skipped: amt<=0")
+                return False
+
         except Exception as e:
-            _dbg(f"[LIVE] MEXC FORCED SELL failed: {e}")
-            # we gaan door met lokale afwikkeling o.b.v. snapshot
+            msg = str(e)
+            _dbg(f"[LIVE] MEXC FORCED SELL error: {msg}")
+            if "Oversold" in msg or "30005" in msg or "Insufficient" in msg:
+                try:
+                    bal       = ex.fetch_balance()
+                    free_amt  = float((bal.get(base) or {}).get("free") or 0.0)
+                    retry_amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, free_amt * 0.995)))
+                    if retry_amt > 0:
+                        order  = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
+                        avg    = order.get("average") or order.get("price") or price
+                        filled = float(order.get("filled") or retry_amt)
+                        price  = float(avg)
+                        if amt_before > 0 and filled < amt_before:
+                            quote_before = quote_before * (filled / amt_before)
+                        amt_before = filled
+                        _dbg(f"[LIVE] MEXC FORCED SELL RETRY ok id={order.get('id')} filled={filled} avg={price}")
+                    else:
+                        _dbg("[LIVE] FORCED RETRY skipped: retry_amt<=0")
+                        return False
+                except Exception as e2:
+                    _dbg(f"[LIVE] FORCED RETRY failed: {e2}")
+                    return False
+
+
+    
 
     # PnL berekenen:
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
