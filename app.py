@@ -778,37 +778,35 @@ def webhook():
         if request.headers.get("X-Webhook-Secret", "") != WEBHOOK_SECRET:
             return "Unauthorized", 401
 
-    _dbg(
-        f"/webhook hit ct={request.headers.get('Content-Type')} raw={request.data[:200]!r}"
-    )
+    _dbg(f"/webhook hit ct={request.headers.get('Content-Type')} raw={request.data[:200]!r}")
 
-    data = request.get_json(force=True, silent=True) or {}
+    data   = request.get_json(force=True, silent=True) or {}
     action = str(data.get("action", "")).lower().strip()
     source = str(data.get("source", "unknown")).lower().strip()
-    tf = str(data.get("tf", "1m")).lower().strip()
+    tf     = str(data.get("tf", "1m")).lower().strip()
+
+    # Parse prijs en bewaar TV-prijs (price kan later vervangen worden door MEXC fill)
     try:
-        price = float(data.get("price", 0))
+        price = float(data.get("price", 0) or 0.0)
     except Exception:
         _dbg("bad price in payload")
         return "Bad price", 400
-
     if price <= 0 or action not in ("buy", "sell"):
         _dbg("bad payload guard (price<=0 of action niet buy/sell)")
         return "Bad payload", 400
-    
-    tv_price  = float(data.get("price", 0) or 0.0)
+    tv_price = price
+
+    # TV symbol guard (alleen LIVE MEXC)
     tv_symbol = str(data.get("tv_symbol", "")).upper()
-    if LIVE_EXCHANGE == "mexc" and tv_symbol and not tv_symbol.startswith("MEXC:XRPUSDT"):
-        _dbg(f"[TVGUARD] ignored non-MEXC alert tv_symbol={tv_symbol}")
-        return "OK", 200
+    if LIVE_EXCHANGE == "mexc" and tv_symbol:
+        if not (tv_symbol.startswith("MEXC:") and tv_symbol.endswith("XRPUSDT")):
+            _dbg(f"[TVGUARD] ignored non-MEXC alert tv_symbol={tv_symbol}")
+            return "OK", 200
 
-    # De-dup & cooldown
+    # De-dup & cooldown (SELL mag cooldown bypassen als we in positie zijn)
     if is_duplicate_signal(action, source, price, tf):
-        _dbg(
-            f"dedup ignored key={(action, source, round(price,4), tf)} win={DEDUP_WINDOW_S}s"
-        )
+        _dbg(f"dedup ignored key={(action, source, round(price,4), tf)} win={DEDUP_WINDOW_S}s")
         return "OK", 200
-
     if blocked_by_cooldown():
         if action == "sell" and in_position:
             _dbg("cooldown bypassed for SELL while in_position")
@@ -833,6 +831,7 @@ def webhook():
             tpsl_reset()
 
     timestamp = now_str()
+
 
     # === BUY ===
     if action == "buy":
@@ -899,12 +898,13 @@ def webhook():
             did = False
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
-                    did = _rehydrate_from_mexc()  # bestaat in jouw code; anders slaat try/except over
+                    did = _rehydrate_from_mexc()
                     _dbg(f"[REHYDRATE] lazy attempt result={did} in_position={in_position} pos_amount={pos_amount}")
                 except NameError:
                     _dbg("[REHYDRATE] function not present; skipping")
                 except Exception as e:
                     _dbg(f"[REHYDRATE] lazy failed: {e}")
+
         # als we nog steeds niets hebben, en er is ook geen echte live size -> terug
         if not in_position and not (LIVE_MODE and LIVE_EXCHANGE == "mexc" and pos_amount > 1e-12):
             _dbg("sell ignored: not in_position")
@@ -915,7 +915,7 @@ def webhook():
 
         # --- LIVE SELL op MEXC (robust + .env tuning) ---
         amt_for_pnl = float(pos_amount)
-        inleg_quote  = float(pos_quote or 0.0) if 'pos_quote' in globals() or 'pos_quote' in locals() else 0.0
+        inleg_quote  = float(pos_quote or 0.0)
 
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
             ex   = None
@@ -950,9 +950,8 @@ def webhook():
                 price  = float(avg)
 
                 # Partial fill → schaal quote-inleg voor PnL
-                if 'pos_quote' in globals() or 'pos_quote' in locals():
-                    if pos_amount > 0 and filled < pos_amount:
-                        inleg_quote = inleg_quote * (filled / pos_amount)
+                if pos_amount > 0 and filled < pos_amount:
+                    inleg_quote = inleg_quote * (filled / pos_amount)
 
                 amt_for_pnl = filled
                 _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={filled} avg={price} amt={amt}")
@@ -976,7 +975,7 @@ def webhook():
                             filled = float(order.get("filled") or retry_amt)
                             price  = float(avg)
 
-                            if ('pos_quote' in globals() or 'pos_quote' in locals()) and pos_amount > 0 and filled < pos_amount:
+                            if pos_amount > 0 and filled < pos_amount:
                                 inleg_quote = inleg_quote * (filled / pos_amount)
 
                             amt_for_pnl = filled
@@ -991,8 +990,6 @@ def webhook():
                     # Andere fout → geen 500 naar TV; laat webhook door
                     return "OK", 200
         # ----------------------------------------------
-
-
 
         _dbg(f"[SELLDBG] amt_for_pnl={amt_for_pnl}, inleg_quote={inleg_quote}, fill={price}")
 
