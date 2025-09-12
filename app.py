@@ -1312,6 +1312,8 @@ def config_view():
         "advisor_secret_set": bool(ADVISOR_SECRET),
         "telegram_config_ok": bool(TG_TOKEN and TG_CHAT_ID),
         "trades_file": TRADES_FILE,
+        "live_pos_amount": round(pos_amount, 6),
+        "live_pos_quote": round(pos_quote, 2),
         # safety
         "sell_retry_ratio": SELL_RETRY_RATIO,
         "sell_epsilon_ticks": SELL_EPSILON_TICKS,
