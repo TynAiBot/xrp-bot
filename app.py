@@ -262,21 +262,51 @@ def now_str():
 
 
 def send_tg(text_html: str):
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": TG_CHAT_ID, "text": text_html, "parse_mode": "HTML"},
-            timeout=6,
-        )
-        if r.status_code != 200:
+    """Stuur een Telegram-bericht met retries + nette afhandeling van rate limits/timeouts."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return False
+
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    data = {"chat_id": TG_CHAT_ID, "text": text_html, "parse_mode": "HTML"}
+
+    for attempt in range(3):
+        try:
+            r = requests.post(url, data=data, timeout=10)
+            if r.status_code == 200:
+                return True
+
+            if r.status_code == 429:
+                # Rate limit: wacht volgens header of json parameters
+                retry_after = 2
+                try:
+                    retry_after = int(r.headers.get("Retry-After") or 2)
+                except Exception:
+                    pass
+                try:
+                    retry_after = int((r.json().get("parameters") or {}).get("retry_after", retry_after))
+                except Exception:
+                    pass
+                time.sleep(min(retry_after, 5))
+                continue
+
             print(f"[TG] {r.status_code} {r.text[:200]}", flush=True)
-    except Exception as e:
-        print(f"[TG ERROR] {e}", flush=True)
+            break
+
+        except requests.exceptions.Timeout:
+            print("[TG] timeout, retrying...", flush=True)
+            time.sleep(1 + attempt)  # 1s, 2s backoff
+        except Exception as e:
+            print(f"[TG ERROR] {e}", flush=True)
+            break
+
+    return False
 
 
 def advisor_allows(action: str, price: float, source: str, tf: str) -> Tuple[bool, str]:
+    """Vraag Advisor (lokaal of extern). Fallback = toestaan."""
     if not ADVISOR_ENABLED or not ADVISOR_URL:
         return True, "advisor_off"
+
     payload = {
         "symbol": SYMBOL_STR,
         "action": action,
@@ -287,6 +317,7 @@ def advisor_allows(action: str, price: float, source: str, tf: str) -> Tuple[boo
     headers = {"Content-Type": "application/json"}
     if ADVISOR_SECRET:
         headers["Authorization"] = f"Bearer {ADVISOR_SECRET}"
+
     try:
         r = requests.post(ADVISOR_URL, json=payload, headers=headers, timeout=2.5)
         try:
@@ -299,7 +330,6 @@ def advisor_allows(action: str, price: float, source: str, tf: str) -> Tuple[boo
     except Exception as e:
         print(f"[ADVISOR] unreachable: {e}", flush=True)
         return True, "advisor_unreachable"
-
 
 # -----------------------
 # TPSL helpers (Optie 3)
