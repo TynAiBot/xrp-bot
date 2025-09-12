@@ -830,20 +830,6 @@ def webhook():
             pos_quote   = 0.0
             tpsl_reset()
 
-    # --- Dust override vóór BUY (negeer mini-restjes) ---
-    # Gebruik dezelfde drempel als rehydrate; val terug op 5 XRP als env ontbreekt.
-    try:
-        _dust_cap = float(os.getenv("REHYDRATE_MIN_XRP", "5"))
-    except Exception:
-        _dust_cap = 5.0
-
-    if action == "buy" and in_position and pos_amount <= _dust_cap:
-        _dbg(f"[DUST] override: in_position={in_position}, pos_amount={pos_amount}≤{_dust_cap} → clear state for BUY")
-        in_position = False
-        entry_price = 0.0
-        pos_amount  = 0.0
-        pos_quote   = 0.0
-        tpsl_reset()
 
     timestamp = now_str()
 
@@ -860,48 +846,35 @@ def webhook():
             _dbg("blocked by trend filter")
             return "OK", 200
 
-        # --- LIVE BUY on MEXC (optional) ---
+        # LIVE BUY op MEXC → gebruik echte fills voor accounting
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
             try:
                 avg, filled, order = _place_mexc_market("buy", START_CAPITAL, price)
-                # Gebruik echte fillprijs en hoeveelheid
-                entry_price = float(avg)
-                pos_amount  = float(filled)
-                # >>> Belangrijk: leg de inleg (quote) vast voor correcte PnL bij SELL
-                pos_quote   = round(entry_price * pos_amount, 8)
+                price       = float(avg)                 # echte fillprijs
+                pos_amount  = float(filled)              # gekochte XRP
+                pos_quote   = round(price * pos_amount, 6)  # USD inleg (bruto)
                 _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg} pos_quote={pos_quote}")
             except Exception as e:
                 _dbg(f"[LIVE] MEXC BUY failed: {e}")
                 return "LIVE BUY failed", 500
         else:
-            # SIMULATIEPAD: leg ook hier pos_amount en pos_quote netjes vast
-            entry_price = price
-            pos_amount  = START_CAPITAL / entry_price
-            pos_quote   = float(START_CAPITAL)
-            _dbg(f"[SIM] BUY entry={entry_price} pos_amount={pos_amount} pos_quote={pos_quote}")
+            # simulatie
+            pos_amount = START_CAPITAL / price
+            pos_quote  = START_CAPITAL
 
+        entry_price    = price if pos_amount > 0 else 0.0
         in_position    = True
         last_action_ts = time.time()
         entry_ts       = time.time()
+        tpsl_on_buy(entry_price)  # gewapend volgens Advisor/ENV
         _dbg(f"BUY executed: entry={entry_price}")
 
-        # --- (5) ARM LOKALE TPSL OP BUY ---
-        if LOCAL_TPSL_ENABLED:
-            ap = _advisor_applied(SYMBOL_STR)  # neem actuele params over
-            tpsl_state["active"]      = True
-            tpsl_state["armed"]       = False
-            tpsl_state["entry_price"] = entry_price
-            tpsl_state["high_water"]  = entry_price
-            tpsl_state["tp_pct"]      = float(ap.get("TAKE_PROFIT_PCT", 0.012))
-            tpsl_state["sl_pct"]      = float(ap.get("STOP_LOSS_PCT",   0.018))
-            tpsl_state["trail_pct"]   = float(ap.get("TRAIL_PCT",       0.006)) if ap.get("USE_TRAILING", True) else 0.0
-            tpsl_state["arm_at_pct"]  = float(ap.get("ARM_AT_PCT",      0.004))
-            _dbg(f"[TPSL] armed on BUY: {tpsl_state}")
-
+        # TG
+        delta_txt = f"  (Δ {(price / tv_price - 1) * 100:+.2f}%)" if tv_price else ""
         send_tg(
             f"""🟢 <b>[XRP/USDT] AANKOOP</b>
-📹 TV prijs: ${price:.4f}
-🎯 Fill (MEXC): ${entry_price:.4f}  (Δ {(entry_price/price - 1)*100:+.2f}%)
+📹 TV prijs: ${tv_price:.4f}
+🎯 Fill (MEXC): ${price:.4f}{delta_txt}
 🧠 Signaalbron: {source} | {advisor_reason}
 🕒 TF: {tf}
 💰 Handelssaldo: €{capital:.2f}
@@ -911,69 +884,60 @@ def webhook():
 🔗 Tijd: {timestamp}"""
         )
 
-        log_trade("buy", entry_price, 0.0, source, tf)
+        log_trade("buy", price, 0.0, source, tf)
         return "OK", 200
 
     
     # === SELL ===
     if action == "sell":
-        # niet in positie? probeer lazy rehydrate voor LIVE MEXC
-        if not in_position:
-            did = False
-            if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-                try:
-                    did = _rehydrate_from_mexc()
-                    _dbg(f"[REHYDRATE] lazy attempt result={did} in_position={in_position} pos_amount={pos_amount}")
-                except NameError:
-                    _dbg("[REHYDRATE] function not present; skipping")
-                except Exception as e:
-                    _dbg(f"[REHYDRATE] lazy failed: {e}")
+        # Als we "denken" geen positie te hebben, probeer lazy rehydrate (MEXC)
+        if not in_position and LIVE_MODE and LIVE_EXCHANGE == "mexc":
+            try:
+                did = _rehydrate_from_mexc()
+                _dbg(f"[REHYDRATE] lazy attempt result={did} in_position={in_position} pos_amount={pos_amount}")
+            except Exception as e:
+                _dbg(f"[REHYDRATE] lazy failed: {e}")
 
-        # als we nog steeds niets hebben, en er is ook geen echte live size -> terug
+        # Geen live grootte en ook niet in_position → niets te doen
         if not in_position and not (LIVE_MODE and LIVE_EXCHANGE == "mexc" and pos_amount > 1e-12):
             _dbg("sell ignored: not in_position")
             return "OK", 200
 
-        # Bewaar TV-verkoopprijs vóór we 'price' vervangen door MEXC fill
-        tv_sell = tv_price
+        tv_sell = float(tv_price or 0.0)
 
-        # --- LIVE SELL op MEXC (robust + .env tuning) ---
-        amt_for_pnl = float(pos_amount)
-        inleg_quote  = float(pos_quote or 0.0)
+        amt_for_pnl = float(pos_amount)  # default: volledige positie
+        inleg_quote = float(pos_quote)   # default: volledige inleg
 
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-            ex   = None
-            base = "XRP"
             try:
-                ex   = _mexc_live()
-                m    = ex.market(SYMBOL_TV)
-                base = m.get("base") or "XRP"
+                ex = _mexc_live()
+                m  = ex.market(SYMBOL_TV)
 
-                # Vrije hoeveelheid XRP
-                bal       = ex.fetch_balance()
-                free_amt  = float((bal.get(base) or {}).get("free") or 0.0)
+                # Bepaal verkoop-amount: wat we willen vs wat vrij is
+                bal      = ex.fetch_balance()
+                base     = m.get("base") or "XRP"
+                free_amt = float((bal.get(base) or {}).get("free") or 0.0)
 
-                # Gewenst vs vrij
-                wanted = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
-                amt    = min(wanted, free_amt)
+                wanted   = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
+                amt      = min(wanted, free_amt)
 
-                # Epsilon onder hoeveelheid-precision (via .env ticks)
-                prec    = int((m.get("precision") or {}).get("amount") or 6)
-                ticks   = max(1, int(SELL_EPSILON_TICKS))
-                epsilon = (10 ** (-prec)) * ticks
-                amt     = max(0.0, amt - epsilon)
-                amt     = float(ex.amount_to_precision(SYMBOL_TV, amt))
+                # epsilon onder precision om "Oversold/Insufficient" te mijden
+                prec      = int((m.get("precision") or {}).get("amount") or 6)
+                ticks     = max(1, int(os.getenv("SELL_EPSILON_TICKS", "1")))
+                epsilon   = (10 ** (-prec)) * ticks
+                amt       = max(0.0, amt - epsilon)
+                amt       = float(ex.amount_to_precision(SYMBOL_TV, amt))
 
                 if amt <= 0:
                     _dbg(f"[LIVE] MEXC SELL skipped: amt<=0 (pos_amount={pos_amount}, free={free_amt})")
                     return "OK", 200
 
-                order  = ex.create_order(SYMBOL_TV, "market", "sell", amt)
-                avg    = order.get("average") or order.get("price") or price
-                filled = float(order.get("filled") or amt)
-                price  = float(avg)
+                order   = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                avg     = float(order.get("average") or order.get("price") or price)
+                filled  = float(order.get("filled") or amt)
+                price   = avg
 
-                # Partial fill → schaal quote-inleg voor PnL
+                # → PnL moet uit verhouding van de BUY-inleg komen
                 if pos_amount > 0 and filled < pos_amount:
                     inleg_quote = inleg_quote * (filled / pos_amount)
 
@@ -983,25 +947,23 @@ def webhook():
             except Exception as e:
                 msg = str(e)
                 _dbg(f"[LIVE] MEXC SELL error: {msg}")
-
-                # Specifiek 'Oversold/Insufficient' → 1 retry met .env ratio
+                # 'Oversold/Insufficient' → 1 retry o.b.v. vrij saldo
                 if "Oversold" in msg or "30005" in msg or "Insufficient" in msg:
                     try:
-                        ex  = ex or _mexc_live()
-                        bal = ex.fetch_balance()
+                        ex   = _mexc_live()
+                        m    = ex.market(SYMBOL_TV)
+                        bal  = ex.fetch_balance()
+                        base = m.get("base") or "XRP"
                         free_amt  = float((bal.get(base) or {}).get("free") or 0.0)
-                        ratio     = float(SELL_RETRY_RATIO or 0.995)
+                        ratio     = float(os.getenv("SELL_RETRY_RATIO", "0.995"))
                         retry_amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, free_amt * ratio)))
-
                         if retry_amt > 0:
                             order  = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
-                            avg    = order.get("average") or order.get("price") or price
+                            avg    = float(order.get("average") or order.get("price") or price)
                             filled = float(order.get("filled") or retry_amt)
-                            price  = float(avg)
-
+                            price  = avg
                             if pos_amount > 0 and filled < pos_amount:
                                 inleg_quote = inleg_quote * (filled / pos_amount)
-
                             amt_for_pnl = filled
                             _dbg(f"[LIVE] MEXC SELL RETRY ok id={order.get('id')} filled={filled} avg={price} amt={retry_amt}")
                         else:
@@ -1011,55 +973,78 @@ def webhook():
                         _dbg(f"[LIVE] RETRY failed: {e2}")
                         return "OK", 200
                 else:
-                    # Andere fout → geen 500 naar TV; laat webhook door
-                    return "OK", 200
-        # ----------------------------------------------
+                    return "OK", 200  # andere fout: geen 500 teruggeven
 
-        _dbg(f"[SELLDBG] amt_for_pnl={amt_for_pnl}, inleg_quote={inleg_quote}, fill={price}")
-
-        # PnL & boeking
+        # PnL: revenue − proportional cost
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-            verkoop_bedrag = price * amt_for_pnl
-            inleg = inleg_quote
-            winst_bedrag = round(verkoop_bedrag - inleg, 2)
+            revenue      = round(price * amt_for_pnl, 6)
+            winst_bedrag = round(revenue - inleg_quote, 2)
         else:
             if entry_price > 0:
                 verkoop_bedrag = price * START_CAPITAL / entry_price
-                winst_bedrag = round(verkoop_bedrag - START_CAPITAL, 2)
+                winst_bedrag   = round(verkoop_bedrag - START_CAPITAL, 2)
             else:
-                _dbg("[SELL] missing entry_price; booking pnl=0 fallback")
                 winst_bedrag = 0.0
 
+        _dbg(f"[SELLDBG] amt_for_pnl={amt_for_pnl}, inleg_quote={inleg_quote}, fill={price}")
         _dbg(f"SELL calc -> price={price} entry={entry_price} pnl={winst_bedrag}")
 
+        # Boekhouding
         if winst_bedrag > 0:
             sparen  += SAVINGS_SPLIT * winst_bedrag
             capital += (1.0 - SAVINGS_SPLIT) * winst_bedrag
         else:
-            capital += winst_bedrag  # verlies ten laste van trading-kapitaal
+            capital += winst_bedrag
 
-        # top-up naar START_CAPITAL
+        # Top-up naar START_CAPITAL
         if capital < START_CAPITAL:
             tekort = START_CAPITAL - capital
             if sparen >= tekort:
                 sparen -= tekort
                 capital += tekort
 
-        # reset state (na berekening!)
-        in_position    = False
-        entry_price    = 0.0
-        pos_amount     = 0.0
-        pos_quote      = 0.0
+        # Verlaag resterende positie bij partial fill
+        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+            if pos_amount > 0:
+                if amt_for_pnl < pos_amount:
+                    # partial: schaal pos_quote omlaag en behoud positie
+                    factor    = (pos_amount - amt_for_pnl) / pos_amount
+                    pos_quote = round(pos_quote * factor, 6)
+                    pos_amount = round(pos_amount - amt_for_pnl, 6)
+                    min_xrp   = float(os.getenv("REHYDRATE_MIN_XRP", "5"))
+                    in_position = pos_amount > min_xrp
+                    entry_price = (pos_quote / pos_amount) if in_position and pos_amount > 0 else 0.0
+                else:
+                    # volledig dicht
+                    pos_amount  = 0.0
+                    pos_quote   = 0.0
+                    in_position = False
+                    entry_price = 0.0
+            else:
+                in_position = False
+                entry_price = 0.0
+                pos_amount  = 0.0
+                pos_quote   = 0.0
+        else:
+            in_position = False
+            entry_price = 0.0
+            pos_amount  = 0.0
+            pos_quote   = 0.0
+
         last_action_ts = time.time()
 
+        # TPSL reset
         if LOCAL_TPSL_ENABLED:
             tpsl_reset()
             _dbg("[TPSL] reset on SELL")
 
-        # TG: toon TV-prijs én MEXC-fill (met delta)
+        # Telegram
         display_fill = price if (LIVE_MODE and LIVE_EXCHANGE == "mexc") else tv_sell
-        delta_txt = f"  (Δ {(display_fill / tv_sell - 1) * 100:+.2f}%)" if tv_sell else ""
-        resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
+        base_for_delta = tv_sell if tv_sell else display_fill
+        delta_txt   = f"  (Δ {(display_fill / base_for_delta - 1) * 100:+.2f}%)" if base_for_delta else ""
+        resultaat   = "Winst" if winst_bedrag >= 0 else "Verlies"
+        rest_txt    = f"\n🪙 Resterend: {pos_amount:.4f} XRP @ ~${entry_price:.4f}" if in_position else ""
+
         send_tg(
             f"""📄 <b>[XRP/USDT] VERKOOP</b>
 📹 TV prijs: ${tv_sell:.4f}
@@ -1071,10 +1056,12 @@ def webhook():
 📈 {resultaat}: €{winst_bedrag:.2f}
 📈 Totale waarde: €{capital + sparen:.2f}
 🔐 Tradebedrag: €{START_CAPITAL:.2f}
-🔗 Tijd: {timestamp}"""
+🔗 Tijd: {timestamp}{rest_txt}"""
         )
+
         log_trade("sell", price, winst_bedrag, source, tf)
         return "OK", 200
+
 
 # -----------------------
 # Safety / forced exits
