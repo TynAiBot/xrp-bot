@@ -635,7 +635,99 @@ def _qty_for_quote(ex, symbol, quote_amount, price):
     return amt
 
 
+# --- LIVE order helpers ------------------------------------------------------
+
 def _place_mexc_market(side: str, quote_amount_usd: float, ref_price: float):
+    ex = _mexc_live()
+    symbol = SYMBOL_TV
+
+    # Bepaal amount in base (XRP) op basis van quote budget
+    amount = _qty_for_quote(ex, symbol, quote_amount_usd, ref_price)
+    if amount <= 0:
+        raise RuntimeError("Calculated amount <= 0")
+
+    # Plaats marktorder
+    order = ex.create_order(symbol, "market", side, amount)
+
+    # Definitieve fills/fees ophalen (sommige velden komen pas na fetch_order)
+    oid = order.get("id")
+    if oid:
+        for _ in range(2):
+            try:
+                time.sleep(0.25)
+                o2 = ex.fetch_order(oid, symbol)
+                if o2:
+                    order = {**order, **o2}
+                    break
+            except Exception:
+                pass
+
+    avg = order.get("average") or order.get("price") or ref_price
+    filled = order.get("filled") or amount
+    return float(avg), float(filled), order
+
+
+def _order_quote_breakdown(ex, symbol, order: dict, side: str):
+    """
+    Haal ccxt-order uiteen in:
+      avg         : gemiddelde fillprijs
+      filled      : gevulde hoeveelheid (base, XRP)
+      gross_quote : bruto USDT (avg * filled of order.cost)
+      fee_quote   : fees omgerekend naar USDT (trade-fee heeft voorrang)
+      net_quote   : BUY = gross + fee ; SELL = gross - fee
+    """
+    side = (side or "").lower().strip()
+    avg = float(order.get("average") or order.get("price") or 0.0)
+    filled = float(order.get("filled") or 0.0)
+    gross = float(order.get("cost") or (avg * filled))
+
+    fee_q = 0.0
+    trades = order.get("trades") or []
+    base_ccy = (ex.market(symbol).get("base") or "").upper()
+
+    # Voorkeur: trade-level fees (voorkomt dubbel tellen)
+    for tr in trades:
+        try:
+            gross = max(gross, float(tr.get("cost") or gross))
+        except Exception:
+            pass
+        ff = tr.get("fee") or {}
+        try:
+            cur = str(ff.get("currency", "")).upper()
+            val = float(ff.get("cost") or 0.0)
+            if val <= 0:
+                continue
+            if cur in {"USDT", "USD"}:
+                fee_q += val
+            elif cur == base_ccy and avg > 0:
+                fee_q += val * avg   # base-fee → quote (USDT)
+            # MX/overige fee-tokens negeren we voor PnL (tenzij je later een rate toevoegt)
+        except Exception:
+            pass
+
+    # Fallback: order-level fees als er geen trades zijn
+    if not trades:
+        for f in (order.get("fees") or []):
+            try:
+                cur = str(f.get("currency", "")).upper()
+                val = float(f.get("cost") or 0.0)
+                if val <= 0:
+                    continue
+                if cur in {"USDT", "USD"}:
+                    fee_q += val
+                elif cur == base_ccy and avg > 0:
+                    fee_q += val * avg
+            except Exception:
+                pass
+
+    net = gross + fee_q if side == "buy" else gross - fee_q
+
+    # Safety voor avg
+    if avg <= 0.0 and filled > 0.0:
+        avg = gross / filled if gross > 0 else 0.0
+
+    return float(avg), float(fee_q), float(gross), float(fee_q), float(net)
+
 
 def _order_quote_breakdown(ex, symbol, order: dict, side: str):
     """
