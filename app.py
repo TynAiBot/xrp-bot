@@ -691,14 +691,13 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
         avg = gross / filled if gross > 0 else 0.0
     return float(avg), float(filled), float(gross), float(fee_q), float(net)
 
+
     ex = _mexc_live()
     symbol = SYMBOL_TV
     amount = _qty_for_quote(ex, symbol, quote_amount_usd, ref_price)
     if amount <= 0:
         raise RuntimeError("Calculated amount <= 0")
     order = ex.create_order(symbol, "market", side, amount)
-
-    # fetch definitive order data (fills/fees) – small retry
     oid = order.get("id")
     if oid:
         for _ in range(2):
@@ -710,7 +709,6 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
                     break
             except Exception:
                 pass
-
     avg = order.get("average") or order.get("price") or ref_price
     filled = order.get("filled") or amount
     return float(avg), float(filled), order
@@ -755,6 +753,11 @@ def _rehydrate_from_mexc():
             return True
         else:
             _dbg(f"[REHYDRATE] small dust {total_amt} XRP -> ignore")
+            # Dust negeren → state echt FLAT zetten
+            in_position = False
+            pos_amount  = 0.0
+            pos_quote   = 0.0
+            entry_price = 0.0
     except Exception as e:
         _dbg(f"[REHYDRATE] failed: {e}")
     return False
@@ -951,11 +954,10 @@ def webhook():
                 avg, filled, order = _place_mexc_market("buy", START_CAPITAL, price)
                 ex = _mexc_live()
                 avg2, filled2, gross_q, fee_q, net_in = _order_quote_breakdown(ex, SYMBOL_TV, order, "buy")
-                price       = float(avg2 or avg)          # echte fillprijs
-                pos_amount  = float(filled2 or filled)    # gekochte XRP
-                pos_quote   = float(net_in if net_in > 0 else round(price * pos_amount, 6))  # netto inleg (incl. USDT-fee)
-                _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}
-")                _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg} pos_quote={pos_quote}")
+                price       = float(avg2 or avg)                 # fillprijs
+                pos_amount  = float(filled2 or filled)           # XRP gekocht
+                pos_quote   = float(net_in if net_in > 0 else round(price * pos_amount, 6))  # netto inleg incl. USDT-fee
+                _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
             except Exception as e:
                 _dbg(f"[LIVE] MEXC BUY failed: {e}")
                 return "LIVE BUY failed", 500
@@ -1020,19 +1022,43 @@ def webhook():
                 base     = m.get("base") or "XRP"
                 free_amt = float((bal.get(base) or {}).get("free") or 0.0)
 
-                wanted   = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
-                amt      = min(wanted, free_amt)
-
-                # epsilon onder precision om "Oversold/Insufficient" te mijden
+                # Precisie, minima en epsilon
                 prec      = int((m.get("precision") or {}).get("amount") or 6)
+                min_amt   = float(((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
                 ticks     = max(1, int(os.getenv("SELL_EPSILON_TICKS", "1")))
                 epsilon   = (10 ** (-prec)) * ticks
-                amt       = max(0.0, amt - epsilon)
-                amt       = float(ex.amount_to_precision(SYMBOL_TV, amt))
 
-                if amt <= 0:
-                    _dbg(f"[LIVE] MEXC SELL skipped: amt<=0 (pos_amount={pos_amount}, free={free_amt})")
+                wanted    = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
+                amt       = min(wanted, free_amt)
+
+                # Pas epsilon alleen toe wanneer we boven minimum blijven
+                if amt - epsilon >= max(min_amt, 0.0):
+                    amt = amt - epsilon
+
+                # Her-quantize
+                amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, amt)))
+
+                if amt <= 0 or (min_amt and amt < min_amt):
+                    _dbg(f"[LIVE] MEXC SELL skipped: amt<{min_amt} (pos_amount={pos_amount}, free={free_amt}) → treat as dust")
+                    if pos_amount <= max(min_amt, float(os.getenv("REHYDRATE_MIN_XRP", "5.0"))):
+                        in_position = False
+                        entry_price = 0.0
+                        pos_amount  = 0.0
+                        pos_quote   = 0.0
+                        send_tg(
+                            f"📄 <b>[XRP/USDT] VERKOOP</b>
+"
+                            f"🧠 Reden: dust_below_exchange_min
+"
+                            f"🪙 Restpositie intern gesloten (dust)
+"
+                            f"🕒 Tijd: {now_str()}"
+                        )
+                    else:
+                        _dbg("[LIVE] leave as dust; no order placed")
                     return "OK", 200
+
+                order   = ex.create_order(SYMBOL_TV, "market", "sell", amt)
 
                 order   = ex.create_order(SYMBOL_TV, "market", "sell", amt)
 
@@ -1046,45 +1072,9 @@ def webhook():
                 if pos_amount > 0 and filled < pos_amount:
                     inleg_quote = inleg_quote * (filled / pos_amount)
 
-                revenue_net = float(net_out)
+                revenue_net = float(net_out)  # netto USDT ontvangen
                 winst_bedrag = round(revenue_net - inleg_quote, 2)
                 _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={filled} avg={price} gross={gross_q} fee_q={fee_q} net_out={revenue_net} pnl={winst_bedrag}")
-                _dbg(f"[LIVE] MEXC SELL id={order.get('id')} filled={filled} avg={price} amt={amt}")
-
-            except Exception as e:
-                msg = str(e)
-                _dbg(f"[LIVE] MEXC SELL error: {msg}")
-                # 'Oversold/Insufficient' → 1 retry o.b.v. vrij saldo
-                if "Oversold" in msg or "30005" in msg or "Insufficient" in msg:
-                    try:
-                        ex   = _mexc_live()
-                        m    = ex.market(SYMBOL_TV)
-                        bal  = ex.fetch_balance()
-                        base = m.get("base") or "XRP"
-                        free_amt  = float((bal.get(base) or {}).get("free") or 0.0)
-                        ratio     = float(os.getenv("SELL_RETRY_RATIO", "0.995"))
-                        retry_amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, free_amt * ratio)))
-                        if retry_amt > 0:
-                            order  = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
-                            avg    = float(order.get("average") or order.get("price") or price)
-                            filled = float(order.get("filled") or retry_amt)
-                            price  = avg
-                            if pos_amount > 0 and filled < pos_amount:
-                                inleg_quote = inleg_quote * (filled / pos_amount)
-                            amt_for_pnl = filled
-                            _dbg(f"[LIVE] MEXC SELL RETRY ok id={order.get('id')} filled={filled} avg={price} amt={retry_amt}")
-                        else:
-                            _dbg("[LIVE] RETRY skipped: retry_amt<=0")
-                            return "OK", 200
-                    except Exception as e2:
-                        _dbg(f"[LIVE] RETRY failed: {e2}")
-                        return "OK", 200
-                else:
-                    return "OK", 200  # andere fout: geen 500 teruggeven
-
-        # PnL: revenue − proportional cost
-        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-            pass  # winst_bedrag already computed using net_out
         else:
             if entry_price > 0:
                 verkoop_bedrag = price * START_CAPITAL / entry_price
