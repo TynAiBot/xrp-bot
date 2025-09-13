@@ -812,7 +812,7 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
     trades = order.get("trades") or []
     base_ccy = (ex.market(symbol).get("base") or "").upper()
 
-    # Voorkeur voor trade-level fees (voorkomt dubbel tellen)
+    # Voorkeur: trade-level fees (voorkomt dubbel tellen)
     for tr in trades:
         try:
             gross = max(gross, float(tr.get("cost") or gross))
@@ -828,11 +828,11 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
                 fee_q += val
             elif cur == base_ccy and avg > 0:
                 fee_q += val * avg   # base-fee → quote (USDT)
-            # MX/andere fee-tokens laten we buiten PnL tenzij je later een rate toevoegt
+            # MX/overige fee-tokens negeren we voor PnL (tenzij je later een rate toevoegt)
         except Exception:
             pass
 
-    # Fallback op order-level fees als er geen trades zitten
+    # Fallback: order-level fees als er geen trades zijn
     if not trades:
         for f in (order.get("fees") or []):
             try:
@@ -854,6 +854,7 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
         avg = gross / filled if gross > 0 else 0.0
 
     return float(avg), float(filled), float(gross), float(fee_q), float(net)
+
 
 # -----------------------
 # Flask
