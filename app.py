@@ -756,6 +756,12 @@ def _rehydrate_from_mexc():
             return True
         else:
             _dbg(f"[REHYDRATE] small dust {total_amt} XRP -> ignore")
+
+        # Dust negeren → maak state echt FLAT zodat we niet blijven loopen
+        in_position = False
+        pos_amount  = 0.0
+        pos_quote   = 0.0
+        entry_price = 0.0
     except Exception as e:
         _dbg(f"[REHYDRATE] failed: {e}")
     return False
@@ -1039,7 +1045,51 @@ def webhook():
                     _dbg(f"[LIVE] MEXC SELL skipped: amt<=0 (pos_amount={pos_amount}, free={free_amt})")
                     return "OK", 200
 
-                order   = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                
+ex = _mexc_live()
+m  = ex.market(SYMBOL_TV)
+
+# Huidige positie/saldo
+bal      = ex.fetch_balance()
+base_ccy = (m.get("base") or "XRP")
+free_amt = float((bal.get(base_ccy) or {}).get("free") or 0.0)
+
+# Precisie en minimale ordergrootte
+prec      = int((m.get("precision") or {}).get("amount") or 6)
+min_amt   = float(((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
+ticks     = max(1, int(os.getenv("SELL_EPSILON_TICKS", "1")))
+epsilon   = (10 ** (-prec)) * ticks
+
+# Wat we willen verkopen: volledige positie
+wanted    = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
+amt       = min(wanted, free_amt)
+
+# Pas epsilon alleen toe als we boven het minimum blijven
+if amt - epsilon >= max(min_amt, 0.0):
+    amt = amt - epsilon
+
+# Her-quantize na epsilon
+amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, amt)))
+
+# Check minima opnieuw
+if amt < min_amt or amt <= 0.0:
+    _dbg(f"[LIVE] SELL skipped: amt<{min_amt} (free={free_amt}, pos={pos_amount}) → treat as dust")
+    if pos_amount <= max(min_amt, float(os.getenv("REHYDRATE_MIN_XRP", "5.0"))):
+        pos_amount  = 0.0
+        pos_quote   = 0.0
+        entry_price = 0.0
+        in_position = False
+        send_tg(
+            f"📄 <b>[XRP/USDT] VERKOOP</b>\n"
+            f"🧠 Reden: dust_below_exchange_min\n"
+            f"🪙 Restpositie intern gesloten (dust)\n"
+            f"🕒 Tijd: {now_str()}"
+        )
+    else:
+        _dbg("[LIVE] leave as dust; no order placed")
+    return "OK", 200
+
+order   = ex.create_order(SYMBOL_TV, "market", "sell", amt)
                 avg     = float(order.get("average") or order.get("price") or price)
                 filled  = float(order.get("filled") or amt)
                 price   = avg
@@ -1091,7 +1141,7 @@ def webhook():
                 verkoop_bedrag = price * START_CAPITAL / entry_price
                 winst_bedrag   = round(verkoop_bedrag - START_CAPITAL, 2)
             else:
-                winst_bedrag = 0.0nd(revenue - inleg_quote, 2)
+                winst_bedrag = round(revenue - inleg_quote, 2)
         else:
             if entry_price > 0:
                 verkoop_bedrag = price * START_CAPITAL / entry_price
