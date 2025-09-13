@@ -808,51 +808,83 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
 
 # Rehydrate live positie (spot)
 def _rehydrate_from_mexc():
-    global in_position, pos_amount, entry_price
+    global in_position, pos_amount, entry_price, pos_quote
     try:
         ex = _mexc_live()
         bal = ex.fetch_balance()
         xrp = bal.get("XRP") or {}
         total_amt = float(xrp.get("total") or 0.0)
+
         if total_amt >= REHYDRATE_MIN_XRP:
+            # Ruwe positie
             pos_amount = float(ex.amount_to_precision(SYMBOL_TV, total_amt))
             in_position = True
-            # schat entry uit recente trades (7d)
+            entry_price = 0.0
+
+            # Schat entry uit recente trades (7 dagen)
             try:
                 since = int((time.time() - 7 * 24 * 3600) * 1000)
                 trades = ex.fetch_my_trades(SYMBOL_TV, since=since)
-                net = 0.0
-                cost = 0.0
+
+                net_base = 0.0     # netto gekochte XRP sinds laatste flatten
+                cost_q   = 0.0     # som van (amount * price) voor buys minus sells
+                fee_buy_q = 0.0    # alleen buy-fees in USDT (of base→USDT) tellen mee voor entry
+                base_ccy = (ex.market(SYMBOL_TV).get("base") or "XRP").upper()
+
                 for t in trades:
-                    amt = float(t.get("amount") or 0.0)
-                    pr = float(t.get("price") or 0.0)
-                    side = t.get("side")
+                    amt  = float(t.get("amount") or 0.0)
+                    pr   = float(t.get("price") or 0.0)
+                    side = (t.get("side") or "").lower()
+
                     if side == "buy":
-                        net += amt
-                        cost += amt * pr
+                        net_base += amt
+                        cost_q   += amt * pr
+                        # fee meenemen als die in USDT is (of base→USDT)
+                        ff = t.get("fee") or {}
+                        try:
+                            cur = str(ff.get("currency", "")).upper()
+                            val = float(ff.get("cost") or 0.0)
+                            if val > 0:
+                                if cur in {"USDT", "USD"}:
+                                    fee_buy_q += val
+                                elif cur == base_ccy and pr > 0:
+                                    fee_buy_q += val * pr
+                        except Exception:
+                            pass
+
                     elif side == "sell":
-                        net -= amt
-                        cost -= amt * pr
-                    if net <= 1e-12:
-                        net, cost = 0.0, 0.0
-                if net > 0 and cost > 0:
-                    entry_price = cost / net
+                        net_base -= amt
+                        cost_q   -= amt * pr
+                        # sell-fees tellen we niet mee voor entry van resterende long
+                        # (die hoorden bij de verkochte kant)
+
+                    # Als we tussendoor volledig vlak gingen, reset accumulators
+                    if net_base <= 1e-12:
+                        net_base, cost_q, fee_buy_q = 0.0, 0.0, 0.0
+
+                if net_base > 0 and (cost_q + fee_buy_q) > 0:
+                    entry_price = (cost_q + fee_buy_q) / net_base
+
             except Exception as e2:
                 _dbg(f"[REHYDRATE] trade-based entry calc failed: {e2}")
-            _dbg(
-                f"[REHYDRATE] detected XRP position amt={pos_amount}, entry≈{entry_price}"
-            )
+
+            # Fallback als entry onbekend bleef (zou zelden gebeuren)
+            if entry_price <= 0.0:
+                try:
+                    tk = ex.fetch_ticker(SYMBOL_TV)
+                    entry_price = float(tk.get("last") or 0.0)
+                except Exception:
+                    entry_price = 0.0
+
+            # >>> Belangrijk: stel pos_quote af op entry * amount (netto inleg-benadering)
+            pos_quote = round(entry_price * pos_amount, 6)
+
+            _dbg(f"[REHYDRATE] detected XRP position amt={pos_amount}, entry≈{entry_price}, pos_quote≈{pos_quote}")
             return True
+
         else:
-            _dbg(f"[REHYDRATE] small dust {total_amt} XRP -> ignore")
-            # Dust negeren → state echt FLAT zetten
-            in_position = False
-            pos_amount  = 0.0
-            pos_quote   = 0.0
-            entry_price = 0.0
-    except Exception as e:
-        _dbg(f"[REHYDRATE] failed: {e}")
-    return False
+            _dbg(f"[REHYDRATE] small dust {total_amt}
+
 
 # --- LIVE order helpers ------------------------------------------------------
 
