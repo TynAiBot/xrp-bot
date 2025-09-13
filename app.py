@@ -647,6 +647,76 @@ def _place_mexc_market(side: str, quote_amount_usd: float, ref_price: float):
     return float(avg), float(filled), order
 
 
+def _order_quote_breakdown(ex, symbol, order: dict, side: str):
+    """
+    Haal uit een ccxt-order:
+      - avg (gemiddelde prijs)
+      - filled (gevulde XRP, base)
+      - gross_quote (bruto USDT = price * amount)
+      - fee_quote (USDT-equivalent fee; base->quote geconverteerd via avg)
+      - net_quote: bij BUY = gross + fee_quote; bij SELL = gross - fee_quote
+    Valt veilig terug op avg*filled als cost/fees ontbreken. Voorkeur: trade-fees boven order-fees.
+    """
+    side = (side or "").lower().strip()
+
+    avg = float(order.get("average") or order.get("price") or 0.0)
+    filled = float(order.get("filled") or 0.0)
+    gross = float(order.get("cost") or (avg * filled))
+
+    fee_q = 0.0
+    used_trade_fees = False
+    trades = order.get("trades") or []
+    if trades:
+        used_trade_fees = True
+        for tr in trades:
+            try:
+                gross = max(gross, float(tr.get("cost") or gross))
+            except Exception:
+                pass
+            ff = tr.get("fee") or {}
+            try:
+                cur = str(ff.get("currency", "")).upper()
+                val = float(ff.get("cost") or 0.0)
+                if val <= 0:
+                    continue
+                if cur in {"USDT", "USD"}:
+                    fee_q += val
+                elif cur == (ex.market(symbol).get("base") or "").upper():
+                    if avg > 0:
+                        fee_q += val * avg
+                else:
+                    pass
+            except Exception:
+                pass
+
+    if not used_trade_fees:
+        for f in (order.get("fees") or []):
+            try:
+                cur = str(f.get("currency", "")).upper()
+                val = float(f.get("cost") or 0.0)
+                if val <= 0:
+                    continue
+                if cur in {"USDT", "USD"}:
+                    fee_q += val
+                elif cur == (ex.market(symbol).get("base") or "").upper():
+                    if avg > 0:
+                        fee_q += val * avg
+                else:
+                    pass
+            except Exception:
+                pass
+
+    if side == "buy":
+        net_quote = gross + fee_q
+    else:
+        net_quote = gross - fee_q
+
+    if avg <= 0.0 and filled > 0.0:
+        avg = gross / filled if gross > 0 else 0.0
+
+    return float(avg), float(filled), float(gross), float(fee_q), float(net_quote)
+
+
 # Rehydrate live positie (spot)
 def _rehydrate_from_mexc():
     global in_position, pos_amount, entry_price
@@ -880,10 +950,17 @@ def webhook():
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
             try:
                 avg, filled, order = _place_mexc_market("buy", START_CAPITAL, price)
-                price       = float(avg)                 # echte fillprijs
-                pos_amount  = float(filled)              # gekochte XRP
-                pos_quote   = round(price * pos_amount, 6)  # USD inleg (bruto)
-                _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={filled} avg={avg} pos_quote={pos_quote}")
+                ex = _mexc_live()
+                a2, f2, gross_q, fee_q, net_in = _order_quote_breakdown(ex, SYMBOL_TV, order, "buy")
+                use_avg  = a2 or avg
+                use_fill = f2 or filled
+                use_in   = net_in if net_in > 0 else round(use_avg * use_fill, 6)
+
+                price      = float(use_avg)      # Fill prijs (gemiddelde)
+                pos_amount = float(use_fill)     # Gekochte XRP (base)
+                pos_quote  = float(use_in)       # Netto inleg in USDT (incl. USDT-fee)
+
+                _dbg(f"[LIVE] MEXC BUY id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
             except Exception as e:
                 _dbg(f"[LIVE] MEXC BUY failed: {e}")
                 return "LIVE BUY failed", 500
@@ -1005,10 +1082,16 @@ def webhook():
                 else:
                     return "OK", 200  # andere fout: geen 500 teruggeven
 
-        # PnL: revenue − proportional cost
+        # PnL: netto opbrengst − proportionele inleg (inclusief fees)
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-            revenue      = round(price * amt_for_pnl, 6)
-            winst_bedrag = round(revenue - inleg_quote, 2)
+            revenue_net = float(net_out)
+            winst_bedrag = round(revenue_net - inleg_quote, 2)
+        else:
+            if entry_price > 0:
+                verkoop_bedrag = price * START_CAPITAL / entry_price
+                winst_bedrag   = round(verkoop_bedrag - START_CAPITAL, 2)
+            else:
+                winst_bedrag = 0.0nd(revenue - inleg_quote, 2)
         else:
             if entry_price > 0:
                 verkoop_bedrag = price * START_CAPITAL / entry_price
@@ -1096,6 +1179,7 @@ def webhook():
 # -----------------------
 # Safety / forced exits
 # -----------------------
+
 def _do_forced_sell(
     price: float, reason: str, source: str = "forced_exit", tf: str = "1m"
 ) -> bool:
@@ -1128,16 +1212,14 @@ def _do_forced_sell(
 
             if amt > 0:
                 order  = ex.create_order(SYMBOL_TV, "market", "sell", amt)
-                avg    = order.get("average") or order.get("price") or price
-                filled = float(order.get("filled") or amt)
-                price  = float(avg)
-
-                # Partial fill → schaal quote-inleg + amt voor PnL
+                a2, f2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
+                price  = float(a2)
+                filled = float(f2)
                 if amt_before > 0 and filled < amt_before:
                     quote_before = quote_before * (filled / amt_before)
-                amt_before = filled
-
-                _dbg(f"[LIVE] MEXC FORCED SELL id={order.get('id')} filled={filled} avg={price}")
+                    amt_before = filled
+                verkoop_bedrag = float(net_out)  # netto USDT ontvangen
+                inleg = float(quote_before)
             else:
                 _dbg("[LIVE] forced sell skipped: amt<=0")
                 return False
@@ -1152,75 +1234,77 @@ def _do_forced_sell(
                     retry_amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, free_amt * 0.995)))
                     if retry_amt > 0:
                         order  = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
-                        avg    = order.get("average") or order.get("price") or price
-                        filled = float(order.get("filled") or retry_amt)
-                        price  = float(avg)
+                        a2, f2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
+                        price  = float(a2)
+                        filled = float(f2)
                         if amt_before > 0 and filled < amt_before:
                             quote_before = quote_before * (filled / amt_before)
-                        amt_before = filled
-                        _dbg(f"[LIVE] MEXC FORCED SELL RETRY ok id={order.get('id')} filled={filled} avg={price}")
+                            amt_before = filled
+                        verkoop_bedrag = float(net_out)
+                        inleg = float(quote_before)
                     else:
                         _dbg("[LIVE] FORCED RETRY skipped: retry_amt<=0")
                         return False
                 except Exception as e2:
                     _dbg(f"[LIVE] FORCED RETRY failed: {e2}")
                     return False
-
-
-    # PnL berekenen:
-    if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-        verkoop_bedrag = float(price) * float(amt_before)
-        inleg = float(quote_before)
+            else:
+                return False
     else:
-        # Simulatiepad (of geen live): val terug op START_CAPITAL/entry
+        # Simulatiepad
         if entry_price > 0:
             verkoop_bedrag = price * START_CAPITAL / entry_price
             inleg = START_CAPITAL
         else:
-            # Als entry onbekend is, boek geen PnL (defensief)
             verkoop_bedrag = START_CAPITAL
             inleg = START_CAPITAL
 
     winst_bedrag = round(verkoop_bedrag - inleg, 2)
 
-    # Boekhouding
+    # Boekhouding (zoals je bestaande SELL-pad)
     if winst_bedrag > 0:
         sparen  += SAVINGS_SPLIT * winst_bedrag
         capital += (1.0 - SAVINGS_SPLIT) * winst_bedrag
     else:
-        capital += winst_bedrag  # verlies ten laste van trading-kapitaal
+        capital += winst_bedrag
 
-    # Top-up terug naar START_CAPITAL
+    # Top-up naar START_CAPITAL
     if capital < START_CAPITAL:
         tekort = START_CAPITAL - capital
         if sparen >= tekort:
             sparen -= tekort
             capital += tekort
 
-    # State reset (pas NA berekening)
     in_position = False
     entry_price = 0.0
     pos_amount  = 0.0
     pos_quote   = 0.0
     last_action_ts = time.time()
-    tpsl_reset()
 
-    # TG + log
-    resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
-    timestamp = now_str()
+    if LOCAL_TPSL_ENABLED:
+        tpsl_reset()
+        _dbg("[TPSL] reset on FORCED SELL")
+
+    # Telegram
+    source_txt = source or "forced_exit"
+    tf_txt     = tf or "1m"
+    timestamp  = now_str()
+    resultaat  = "Winst" if winst_bedrag >= 0 else "Verlies"
+
     send_tg(
-        "🚨 <b>[XRP/USDT] FORCED SELL</b>\n"
-        f"📹 Verkoopprijs: ${price:.4f}\n"
-        f"🧠 Reden: {reason}\n"
-        f"🕒 TF: {tf}\n"
-        f"💰 Handelssaldo: €{capital:.2f}\n"
-        f"💼 Spaarrekening: €{sparen:.2f}\n"
-        f"📈 {resultaat}: €{winst_bedrag:.2f}\n"
-        f"📈 Totale waarde: €{capital + sparen:.2f}\n"
-        f"🔐 Tradebedrag: €{START_CAPITAL:.2f}\n"
-        f"🔗 Tijd: {timestamp}"
+        f"""🚨 <b>[XRP/USDT] FORCED SELL</b>
+📹 Verkoopprijs: ${price:.4f}
+🧠 Reden: {reason}
+🕒 TF: {tf_txt}
+💰 Handelssaldo: €{capital:.2f}
+💼 Spaarrekening: €{sparen:.2f}
+📈 {resultaat}: €{winst_bedrag:.2f}
+📈 Totale waarde: €{capital + sparen:.2f}
+🔐 Tradebedrag: €{START_CAPITAL:.2f}
+🔗 Tijd: {timestamp}"""
     )
-    log_trade("sell", price, winst_bedrag, source, tf)
+
+    log_trade("forced_sell", price, winst_bedrag, source_txt, tf_txt)
     return True
 
 
