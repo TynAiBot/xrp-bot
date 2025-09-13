@@ -805,7 +805,6 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
     filled = order.get("filled") or amount
     return float(avg), float(filled), order
 
-
 # Rehydrate live positie (spot)
 def _rehydrate_from_mexc():
     global in_position, pos_amount, entry_price, pos_quote
@@ -855,8 +854,7 @@ def _rehydrate_from_mexc():
                     elif side == "sell":
                         net_base -= amt
                         cost_q   -= amt * pr
-                        # sell-fees tellen we niet mee voor entry van resterende long
-                        # (die hoorden bij de verkochte kant)
+                        # sell-fees horen bij de verkochte kant → niet in entry van de resterende long
 
                     # Als we tussendoor volledig vlak gingen, reset accumulators
                     if net_base <= 1e-12:
@@ -883,7 +881,17 @@ def _rehydrate_from_mexc():
             return True
 
         else:
-            _dbg(f"[REHYDRATE] small dust {total_amt}
+            _dbg(f"[REHYDRATE] small dust {total_amt} XRP -> ignore")
+            # Dust negeren → state echt FLAT zetten
+            in_position = False
+            pos_amount  = 0.0
+            pos_quote   = 0.0
+            entry_price = 0.0
+
+    except Exception as e:
+        _dbg(f"[REHYDRATE] failed: {e}")
+
+    return False
 
 
 # --- LIVE order helpers ------------------------------------------------------
