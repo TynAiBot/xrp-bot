@@ -560,6 +560,66 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
         avg = gross / filled if gross > 0 else 0.0
     return float(avg), float(filled), float(gross), float(fee_q), float(net)
 
+def _prepare_sell_amount(ex, symbol: str, desired_amt: float):
+    """
+    Bepaalt een veilige SELL-amount met exchange-limits en precisie.
+    Retourneert (amt, info) waarbij amt=0.0 betekent: onder minimum (dust).
+    """
+    m = ex.market(symbol)
+    prec = int((m.get("precision") or {}).get("amount") or 6)
+    lims = (m.get("limits") or {}).get("amount") or {}
+    min_from_limits = float(lims.get("min") or 0.0)
+    min_from_precision = (10 ** (-prec)) if prec > 0 else 0.0
+    fallback_min = float(os.getenv("FALLBACK_MIN_XRP", "0.01"))
+    min_amt = max(min_from_limits, min_from_precision, fallback_min)
+
+    bal = ex.fetch_balance()
+    base = (m.get("base") or symbol.split("/")[0]).upper()
+    free_amt = float((bal.get(base) or {}).get("free") or 0.0)
+
+    wanted = min(float(desired_amt), free_amt)
+
+    try:
+        rounded = float(ex.amount_to_precision(symbol, wanted))
+    except Exception:
+        rounded = wanted
+
+    ticks = max(0, int(os.getenv("SELL_EPSILON_TICKS", "1")))
+    epsilon = ((10 ** (-prec)) if prec > 0 else 0.0) * ticks
+
+    amt = rounded
+    if epsilon > 0 and (amt - epsilon) >= min_amt:
+        amt = amt - epsilon
+        try:
+            amt = float(ex.amount_to_precision(symbol, amt))
+        except Exception:
+            pass
+
+    # Als afronding onder min valt maar free >= min → verkoop min_amt
+    if amt < min_amt:
+        if free_amt >= min_amt:
+            amt = min_amt
+            try:
+                amt = float(ex.amount_to_precision(symbol, amt))
+            except Exception:
+                pass
+
+    info = {
+        "prec": prec,
+        "min_from_limits": min_from_limits,
+        "min_from_precision": min_from_precision,
+        "fallback_min": fallback_min,
+        "min_amt": min_amt,
+        "free_amt": free_amt,
+        "desired": float(desired_amt),
+        "wanted": float(wanted),
+        "rounded": float(rounded),
+        "epsilon": float(epsilon),
+        "final_amt": float(amt),
+    }
+    if amt <= 0.0 or amt < min_amt:
+        return 0.0, info
+    return amt, info
 
 def _place_mexc_market(symbol: str, side: str, quote_amount_usd: float, ref_price: float):
     ex = _mexc_live()
@@ -1074,38 +1134,45 @@ def webhook():
 
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
             try:
-                ex = _mexc_live()
-                m = ex.market(SYMBOL_TV)
-                bal = ex.fetch_balance()
-                base = m.get("base") or SYMBOL_TV.split("/")[0]
+            ex = _mexc_live()
+            # veilige sell-amount bepalen
+            amt, info = _prepare_sell_amount(ex, SYMBOL_TV, pos_amount)
+            _dbg(f"[SELL PREP] {SYMBOL_TV} info={info}")
+            if amt <= 0.0:
+                _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount}, free={info.get('free_amt')}) → dust")
+                if pos_amount <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
+                    in_position = False
+                    entry_price = 0.0
+                    pos_amount = 0.0
+                    pos_quote = 0.0
+                    send_tg(f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n🧠 Reden: dust_below_exchange_min\n🪙 Restpositie intern gesloten (dust)\n🕒 Tijd: {now_str()}")
+                    log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
+                    commit(SYMBOL_TV)
+                else:
+                    _dbg("[LIVE] leave as dust; no order placed")
+                return "OK", 200
 
-                free_amt = float((bal.get(base) or {}).get("free") or 0.0)
-                prec = int((m.get("precision") or {}).get("amount") or 6)
-                lims = (m.get("limits") or {}).get("amount") or {}
-                min_from_limits = float(lims.get("min") or 0.0)
-                min_from_precision = (10 ** (-prec)) if prec > 0 else 0.0
-                min_amt = max(min_from_limits, min_from_precision, float(os.getenv("FALLBACK_MIN_XRP", "0.01")))
-
-                ticks = max(1, int(os.getenv("SELL_EPSILON_TICKS", "1")))
-                epsilon = (10 ** (-prec)) * ticks
-
-                wanted = float(ex.amount_to_precision(SYMBOL_TV, pos_amount))
-                amt = min(wanted, free_amt)
-
-                if amt < min_amt or amt <= 0.0:
-                    _dbg(f"[LIVE] SELL skipped: amt<{min_amt} (pos={pos_amount}, free={free_amt}) → dust")
-                    # Interne sluiting bij echte restanten
-                    if pos_amount <= max(min_amt, REHYDRATE_MIN_XRP):
-                        in_position = False
-                        entry_price = 0.0
-                        pos_amount = 0.0
-                        pos_quote = 0.0
-                        send_tg(f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n🧠 Reden: dust_below_exchange_min\n🪙 Restpositie intern gesloten (dust)\n🕒 Tijd: {now_str()}")
-                        log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
-                        commit(SYMBOL_TV)
-                    else:
-                        _dbg("[LIVE] leave as dust; no order placed")
+            try:
+                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+            except Exception as e_sell:
+                msg = str(e_sell).lower()
+                # één retry met minimaal toelaatbare amount
+                if "minimum amount" in msg or "precision" in msg or "min" in msg:
+                    min_retry = info.get("min_amt", 0.0)
+                    if info.get("free_amt", 0.0) >= min_retry and min_retry > 0:
+                        try:
+                            retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
+                            _dbg(f"[SELL RETRY] using min_amt={retry_amt}")
+                            order = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
+                        except Exception as e2:
+                            _dbg(f"[LIVE] SELL retry failed: {e2}")
+                            commit(SYMBOL_TV)
+                            return "OK", 200
+                else:
+                    _dbg(f"[LIVE] MEXC SELL error: {e_sell}")
+                    commit(SYMBOL_TV)
                     return "OK", 200
+
 
                 if amt - epsilon >= min_amt:
                     amt = amt - epsilon
@@ -1236,27 +1303,11 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
         try:
             ex = _mexc_live()
-            m = ex.market(SYMBOL_TV)
-            base = m.get("base") or SYMBOL_TV.split("/")[0]
-
-            bal = ex.fetch_balance()
-            free_amt = float((bal.get(base) or {}).get("free") or 0.0)
-
-            prec = int((m.get("precision") or {}).get("amount") or 6)
-            lims = (m.get("limits") or {}).get("amount") or {}
-            min_from_limits = float(lims.get("min") or 0.0)
-            min_from_precision = (10 ** (-prec)) if prec > 0 else 0.0
-            min_amt = max(min_from_limits, min_from_precision, float(os.getenv("FALLBACK_MIN_XRP", "0.01")))
-
-            ticks = max(1, int(os.getenv("SELL_EPSILON_TICKS", "1")))
-            epsilon = (10 ** (-prec)) * ticks
-
-            wanted = float(ex.amount_to_precision(SYMBOL_TV, amt_before))
-            amt = min(wanted, free_amt)
-
-            if amt < min_amt or amt <= 0.0:
-                _dbg(f"[LIVE] FORCED SELL skipped: amt<{min_amt} (pos={pos_amount}, free={free_amt}) → dust")
-                if amt_before <= max(min_amt, REHYDRATE_MIN_XRP):
+            amt, info = _prepare_sell_amount(ex, SYMBOL_TV, amt_before)
+            _dbg(f"[FORCED SELL PREP] {SYMBOL_TV} info={info}")
+            if amt <= 0.0:
+                _dbg(f"[LIVE] FORCED SELL skipped: <min_amt (pos={pos_amount}, free={info.get('free_amt')}) → dust")
+                if amt_before <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
                     in_position = False
                     entry_price = 0.0
                     pos_amount = 0.0
@@ -1265,9 +1316,23 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
                     log_trade("sell_forced", display_fill, 0.0, source, tf, SYMBOL_TV)
                 return False
 
-            if amt - epsilon >= min_amt:
-                amt = amt - epsilon
-            amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, amt)))
+            try:
+                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+            except Exception as e_sell:
+                msg = str(e_sell).lower()
+                if "minimum amount" in msg or "precision" in msg or "min" in msg:
+                    min_retry = info.get("min_amt", 0.0)
+                    if info.get("free_amt", 0.0) >= min_retry and min_retry > 0:
+                        try:
+                            retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
+                            _dbg(f"[FORCED SELL RETRY] using min_amt={retry_amt}")
+                            order = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
+                        except Exception as e2:
+                            _dbg(f"[LIVE] FORCED SELL retry failed: {e2}")
+                            return False
+                else:
+                    _dbg(f"[LIVE] MEXC FORCED SELL error: {e_sell}")
+                    return False
 
             order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
 
