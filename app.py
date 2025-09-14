@@ -51,6 +51,10 @@ def env_float(name: str, default=0.0) -> float:
 
 load_dotenv()
 
+# Webserver poort (Render levert PORT via env)
+PORT = env_int("PORT", 10000)
+
+
 # -----------------------
 # Basis & symbol
 # -----------------------
@@ -200,8 +204,6 @@ def _dbg(msg: str):
     if DEBUG_SIG:
         print(f"[SIGDBG] {msg}", flush=True)
 
-
-_dbg("booted")
 
 # -----------------------
 # Runtime state
