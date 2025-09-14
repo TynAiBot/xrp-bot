@@ -12,7 +12,7 @@
 
 import os, time, json
 from datetime import datetime, timedelta
-from threading import Thread
+from threading import Thread, Lock
 from typing import Tuple, Dict, Any
 
 import requests
@@ -1139,9 +1139,9 @@ def webhook():
             winst_bedrag = 0.0
             display_fill = tv_sell
 
-            # snapshots zodat idle_worker onze PnL niet beïnvloedt
+            # snapshots zodat idle_worker ons niet beïnvloedt
             pos_amount0 = float(pos_amount)
-            pos_quote0 = float(pos_quote)
+            pos_quote0  = float(pos_quote)
 
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
@@ -1154,8 +1154,8 @@ def webhook():
                         if pos_amount0 <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
                             in_position = False
                             entry_price = 0.0
-                            pos_amount = 0.0
-                            pos_quote = 0.0
+                            pos_amount  = 0.0
+                            pos_quote   = 0.0
                             send_tg(f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n🧠 Reden: dust_below_exchange_min\n🪙 Restpositie intern gesloten (dust)\n🕒 Tijd: {now_str()}")
                             log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
                             commit(SYMBOL_TV)
@@ -1208,14 +1208,14 @@ def webhook():
 
                 avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
                 display_fill = float(avg2)
-                filled = float(filled2)
+                filled       = float(filled2)
 
                 # Inleg baseren op snapshot
                 inleg_quote = float(pos_quote0)
                 if pos_amount0 > 0 and filled < pos_amount0:
                     inleg_quote = inleg_quote * (filled / pos_amount0)
 
-                revenue_net = float(net_out)
+                revenue_net  = float(net_out)
                 winst_bedrag = round(revenue_net - inleg_quote, 2)
 
                 _dbg(f"[LIVE] MEXC SELL {SYMBOL_TV} id={order.get('id')} filled={filled} avg={display_fill} gross={gross_q} fee_q={fee_q} net_out={revenue_net} pnl={winst_bedrag}")
@@ -1223,11 +1223,11 @@ def webhook():
             else:
                 if entry_price > 0:
                     verkoop_bedrag = price * get_budget(SYMBOL_TV) / entry_price
-                    winst_bedrag = round(verkoop_bedrag - get_budget(SYMBOL_TV), 2)
+                    winst_bedrag   = round(verkoop_bedrag - get_budget(SYMBOL_TV), 2)
 
             # Boekhouding
             if winst_bedrag > 0:
-                sparen += SAVINGS_SPLIT * winst_bedrag
+                sparen  += SAVINGS_SPLIT * winst_bedrag
                 capital += (1.0 - SAVINGS_SPLIT) * winst_bedrag
             else:
                 capital += winst_bedrag
@@ -1235,7 +1235,7 @@ def webhook():
             if capital < START_CAPITAL:
                 tekort = START_CAPITAL - capital
                 if sparen >= tekort:
-                    sparen -= tekort
+                    sparen  -= tekort
                     capital += tekort
 
             # Positie bijwerken met snapshot (partial/full)
@@ -1245,20 +1245,20 @@ def webhook():
                 except NameError:
                     filled = pos_amount0
                 if pos_amount0 > 0 and filled < pos_amount0:
-                    factor = (pos_amount0 - filled) / pos_amount0
-                    pos_quote = round(pos_quote0 * factor, 6)
+                    factor     = (pos_amount0 - filled) / pos_amount0
+                    pos_quote  = round(pos_quote0 * factor, 6)
                     pos_amount = round(pos_amount0 - filled, 6)
                     in_position = pos_amount > REHYDRATE_MIN_XRP
                     entry_price = (pos_quote / pos_amount) if in_position and pos_amount > 0 else 0.0
                 else:
-                    pos_amount = 0.0
-                    pos_quote = 0.0
+                    pos_amount  = 0.0
+                    pos_quote   = 0.0
                     in_position = False
                     entry_price = 0.0
             else:
                 in_position = False
-                pos_amount = 0.0
-                pos_quote = 0.0
+                pos_amount  = 0.0
+                pos_quote   = 0.0
                 entry_price = 0.0
 
             last_action_ts = time.time()
@@ -1268,7 +1268,7 @@ def webhook():
             base_for_delta = tv_sell if tv_sell else display_fill
             delta_txt = f"  (Δ {(display_fill / base_for_delta - 1) * 100:+.2f}%)" if base_for_delta else ""
             resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
-            rest_txt = f"\n🪙 Resterend: {pos_amount:.4f} @ ~${entry_price:.6f}" if in_position else ""
+            rest_txt  = f"\n🪙 Resterend: {pos_amount:.4f} @ ~${entry_price:.6f}" if in_position else ""
 
             send_tg(
                 f"""📄 <b>[{SYMBOL_TV}] VERKOOP</b>
@@ -1286,7 +1286,6 @@ def webhook():
             log_trade("sell", display_fill, winst_bedrag, source, tf, SYMBOL_TV)
             commit(SYMBOL_TV)
             return "OK", 200
-
 
 # --------------- Forced exits ---------------
 def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
@@ -1459,8 +1458,6 @@ def forced_exit_check(symbol_tv: str, last_price: float | None = None):
         # Lokale TPSL
         local_tpsl_check(last_price)
         commit(symbol_tv)
-
-
 
 # --------------- Reports ---------------
 @app.route("/report/daily", methods=["GET"])
