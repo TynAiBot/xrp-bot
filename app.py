@@ -1134,25 +1134,25 @@ def webhook():
 
         if LIVE_MODE and LIVE_EXCHANGE == "mexc":
             try:
-            ex = _mexc_live()
-            # veilige sell-amount bepalen
-            amt, info = _prepare_sell_amount(ex, SYMBOL_TV, pos_amount)
-            _dbg(f"[SELL PREP] {SYMBOL_TV} info={info}")
-            if amt <= 0.0:
-                _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount}, free={info.get('free_amt')}) → dust")
-                if pos_amount <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
-                    in_position = False
-                    entry_price = 0.0
-                    pos_amount = 0.0
-                    pos_quote = 0.0
-                    send_tg(f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n🧠 Reden: dust_below_exchange_min\n🪙 Restpositie intern gesloten (dust)\n🕒 Tijd: {now_str()}")
-                    log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
-                    commit(SYMBOL_TV)
-                else:
-                    _dbg("[LIVE] leave as dust; no order placed")
-                return "OK", 200
+                ex = _mexc_live()
+                # veilige sell-amount bepalen
+                amt, info = _prepare_sell_amount(ex, SYMBOL_TV, pos_amount)
+                _dbg(f"[SELL PREP] {SYMBOL_TV} info={info}")
+                if amt <= 0.0:
+                    _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount}, free={info.get('free_amt')}) → dust")
+                    if pos_amount <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
+                        in_position = False
+                        entry_price = 0.0
+                        pos_amount = 0.0
+                        pos_quote = 0.0
+                        send_tg(f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n🧠 Reden: dust_below_exchange_min\n🪙 Restpositie intern gesloten (dust)\n🕒 Tijd: {now_str()}")
+                        log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
+                        commit(SYMBOL_TV)
+                    else:
+                        _dbg("[LIVE] leave as dust; no order placed")
+                    return "OK", 200
 
-            try:
+                # plaats order
                 order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
             except Exception as e_sell:
                 msg = str(e_sell).lower()
@@ -1172,15 +1172,7 @@ def webhook():
                     _dbg(f"[LIVE] MEXC SELL error: {e_sell}")
                     commit(SYMBOL_TV)
                     return "OK", 200
-
-
-                if amt - epsilon >= min_amt:
-                    amt = amt - epsilon
-                amt = float(ex.amount_to_precision(SYMBOL_TV, max(0.0, amt)))
-
-                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
-
-                oid = order.get("id")
+oid = order.get("id")
                 if oid:
                     for _ in range(3):
                         try:
