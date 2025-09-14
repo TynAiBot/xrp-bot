@@ -1145,7 +1145,12 @@ def webhook():
                         entry_price = 0.0
                         pos_amount = 0.0
                         pos_quote = 0.0
-                        send_tg(f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n🧠 Reden: dust_below_exchange_min\n🪙 Restpositie intern gesloten (dust)\n🕒 Tijd: {now_str()}")
+                        send_tg(
+                            f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n"
+                            f"🧠 Reden: dust_below_exchange_min\n"
+                            f"🪙 Restpositie intern gesloten (dust)\n"
+                            f"🕒 Tijd: {now_str()}"
+                        )
                         log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
                         commit(SYMBOL_TV)
                     else:
@@ -1154,6 +1159,7 @@ def webhook():
 
                 # plaats order
                 order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+
             except Exception as e_sell:
                 msg = str(e_sell).lower()
                 # één retry met minimaal toelaatbare amount
@@ -1172,42 +1178,45 @@ def webhook():
                     _dbg(f"[LIVE] MEXC SELL error: {e_sell}")
                     commit(SYMBOL_TV)
                     return "OK", 200
-oid = order.get("id")
-                if oid:
-                    for _ in range(3):
-                        try:
-                            time.sleep(0.25)
-                            o2 = ex.fetch_order(oid, SYMBOL_TV)
-                            if o2:
-                                order = {**order, **o2}
-                            if not order.get("trades"):
-                                try:
-                                    trs = ex.fetch_order_trades(oid, SYMBOL_TV)
-                                    if trs:
-                                        order["trades"] = trs
-                                except Exception:
-                                    pass
-                            if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
-                                break
-                        except Exception:
-                            pass
 
-                avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
-                display_fill = float(avg2)
-                filled = float(filled2)
+            # ---- order opvullen en PnL berekenen ----
+            oid = order.get("id")
+            if oid:
+                for _ in range(3):
+                    try:
+                        time.sleep(0.25)
+                        o2 = ex.fetch_order(oid, SYMBOL_TV)
+                        if o2:
+                            order = {**order, **o2}
+                        if not order.get("trades"):
+                            try:
+                                trs = ex.fetch_order_trades(oid, SYMBOL_TV)
+                                if trs:
+                                    order["trades"] = trs
+                            except Exception:
+                                pass
+                        if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
+                            break
+                    except Exception:
+                        pass
 
-                inleg_quote = float(pos_quote)
-                if pos_amount > 0 and filled < pos_amount:
-                    inleg_quote = inleg_quote * (filled / pos_amount)
+            avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
+            display_fill = float(avg2)
+            filled = float(filled2)
 
-                revenue_net = float(net_out)
-                winst_bedrag = round(revenue_net - inleg_quote, 2)
+            inleg_quote = float(pos_quote)
+            if pos_amount > 0 and filled < pos_amount:
+                inleg_quote = inleg_quote * (filled / pos_amount)
 
-                _dbg(f"[LIVE] MEXC SELL {SYMBOL_TV} id={order.get('id')} filled={filled} avg={display_fill} gross={gross_q} fee_q={fee_q} net_out={revenue_net} pnl={winst_bedrag}")
-            except Exception as e:
-                _dbg(f"[LIVE] MEXC SELL error: {e}")
-                commit(SYMBOL_TV)
-                return "OK", 200
+            revenue_net = float(net_out)
+            winst_bedrag = round(revenue_net - inleg_quote, 2)
+
+            _dbg(
+                f"[LIVE] MEXC SELL {SYMBOL_TV} id={order.get('id')} "
+                f"filled={filled} avg={display_fill} gross={gross_q} fee_q={fee_q} "
+                f"net_out={revenue_net} pnl={winst_bedrag}"
+            )
+
         else:
             if entry_price > 0:
                 verkoop_bedrag = price * get_budget(SYMBOL_TV) / entry_price
@@ -1274,11 +1283,6 @@ oid = order.get("id")
         log_trade("sell", display_fill, winst_bedrag, source, tf, SYMBOL_TV)
         commit(SYMBOL_TV)
         return "OK", 200
-
-    # default
-    commit(SYMBOL_TV)
-    return "OK", 200
-
 
 # --------------- Forced exits ---------------
 def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
