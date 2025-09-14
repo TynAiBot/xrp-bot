@@ -1826,23 +1826,38 @@ def idle_worker():
             print(f"[IDLE] error: {e}")
             continue
 
-
 # -----------------------
 # Main
 # -----------------------
 if __name__ == "__main__":
-    _advisor_load()
-    load_trades()
-
-    # On boot: rehydrate live positie (na defs)
-    if LIVE_MODE and LIVE_EXCHANGE == "mexc" and REHYDRATE_ON_BOOT:
+    # (optioneel) advisor inladen
+    if "_advisor_load" in globals():
         try:
-            _rehydrate_from_mexc()
-        except Exception as _e:
-            _dbg(f"[REHYDRATE] on boot error: {_e}")
+            _advisor_load()
+        except Exception as e:
+            _dbg(f"[ADVISOR] _advisor_load() failed: {e}")
+    else:
+        _dbg("[ADVISOR] no _advisor_load() defined — skipping")
 
-    port = int(os.environ.get("PORT", "5000"))
-    print(f"✅ Webhook server op http://0.0.0.0:{port}/webhook")
-    Thread(target=idle_worker, daemon=True).start()
-    send_tg("✅ XRP-bot gestart op Render")
-    app.run(host="0.0.0.0", port=port)
+    _dbg("booted")
+
+    # (optioneel) historische trades laden – alleen als de functie bestaat
+    if "load_trades" in globals():
+        try:
+            load_trades()
+        except Exception as e:
+            _dbg(f"[TRADES] load_trades() failed: {e}")
+    else:
+        _dbg("[TRADES] no load_trades() defined — skipping history load")
+
+    # Rehydrate alle geconfigureerde paren (XRP/USDT, WLFI/USDT)
+    try:
+        _rehydrate_all_symbols()
+    except Exception as e:
+        _dbg(f"[REHYDRATE] all symbols failed: {e}")
+
+    # Start Flask
+    _dbg(f"✅ Webhook server op http://0.0.0.0:{PORT}/webhook")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
