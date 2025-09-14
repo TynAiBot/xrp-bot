@@ -108,6 +108,7 @@ pos_quote = 0.0
 capital = START_CAPITAL
 sparen = float(os.getenv("SPAREN_START", "500"))
 tpsl_state = _fresh_tpsl()
+SYMBOL_LOCKS = {s: Lock() for s in TRADEABLE}
 
 # De-dup window & per-key timestamp
 MIN_TRADE_COOLDOWN_S = env_int("MIN_TRADE_COOLDOWN_S", 0)  # user: vaak 0s
@@ -1066,47 +1067,50 @@ def webhook():
 
     # === BUY ===
     if action == "buy":
-        if in_position:
-            _dbg(f"buy ignored: already in_position at entry={entry_price}")
-            commit(SYMBOL_TV)
-            return "OK", 200
-
-        ok, ma = trend_ok(price, SYMBOL_TV)
-        _dbg(f"trend_ok={ok} ma={ma:.6f} price={price:.6f}")
-        if not ok:
-            _dbg("blocked by trend filter")
-            commit(SYMBOL_TV)
-            return "OK", 200
-
-        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-            try:
-                order = _place_mexc_market(SYMBOL_TV, "buy", TRADE_BUDGET, price)
-                ex = _mexc_live()
-                avg2, filled2, gross_q, fee_q, net_in = _order_quote_breakdown(ex, SYMBOL_TV, order, "buy")
-
-                price = float(avg2)
-                pos_amount = float(filled2)
-                pos_quote = float(net_in if net_in > 0 else round(price * pos_amount, 6))
-
-                _dbg(f"[LIVE] MEXC BUY {SYMBOL_TV} id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
-            except Exception as e:
-                _dbg(f"[LIVE] MEXC BUY failed: {e}")
+        # Lock per symbool: beschermt tegen bind()/commit() van idle_worker
+        lock = SYMBOL_LOCKS.setdefault(SYMBOL_TV, Lock())
+        with lock:
+            if in_position:
+                _dbg(f"buy ignored: already in_position at entry={entry_price}")
                 commit(SYMBOL_TV)
-                return "LIVE BUY failed", 500
-        else:
-            pos_amount = TRADE_BUDGET / price
-            pos_quote = TRADE_BUDGET
+                return "OK", 200
 
-        entry_price = price if pos_amount > 0 else 0.0
-        in_position = True
-        last_action_ts = time.time()
-        entry_ts = time.time()
-        tpsl_on_buy(entry_price)
+            ok, ma = trend_ok(price, SYMBOL_TV)
+            _dbg(f"trend_ok={ok} ma={ma:.6f} price={price:.6f}")
+            if not ok:
+                _dbg("blocked by trend filter")
+                commit(SYMBOL_TV)
+                return "OK", 200
 
-        # Telegram
-        delta_txt = f"  (Δ {(price / tv_price - 1) * 100:+.2f}%)" if tv_price else ""
-        send_tg(
-            f"""🟢 <b>[{SYMBOL_TV}] AANKOOP</b>
+            if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+                try:
+                    order = _place_mexc_market(SYMBOL_TV, "buy", TRADE_BUDGET, price)
+                    ex = _mexc_live()
+                    avg2, filled2, gross_q, fee_q, net_in = _order_quote_breakdown(ex, SYMBOL_TV, order, "buy")
+
+                    price = float(avg2)
+                    pos_amount = float(filled2)
+                    pos_quote = float(net_in if net_in > 0 else round(price * pos_amount, 6))
+
+                    _dbg(f"[LIVE] MEXC BUY {SYMBOL_TV} id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
+                except Exception as e:
+                    _dbg(f"[LIVE] MEXC BUY failed: {e}")
+                    commit(SYMBOL_TV)
+                    return "LIVE BUY failed", 500
+            else:
+                pos_amount = TRADE_BUDGET / price
+                pos_quote = TRADE_BUDGET
+
+            entry_price = price if pos_amount > 0 else 0.0
+            in_position = True
+            last_action_ts = time.time()
+            entry_ts = time.time()
+            tpsl_on_buy(entry_price)
+
+            # Telegram
+            delta_txt = f"  (Δ {(price / tv_price - 1) * 100:+.2f}%)" if tv_price else ""
+            send_tg(
+                f"""🟢 <b>[{SYMBOL_TV}] AANKOOP</b>
 📹 TV prijs: ${tv_price:.6f}
 🎯 Fill (MEXC): ${price:.6f}{delta_txt}
 🧠 Signaalbron: {source} | {advisor_reason}
@@ -1116,159 +1120,158 @@ def webhook():
 📈 Totale waarde: €{capital + sparen:.2f}
 🔐 Tradebedrag: €{TRADE_BUDGET:.2f}
 🔗 Tijd: {timestamp}"""
-        )
-        log_trade("buy", price, 0.0, source, tf, SYMBOL_TV)
-        commit(SYMBOL_TV)
-        return "OK", 200
-
-    # === SELL ===
-    if action == "sell":
-        if not in_position:
-            _dbg("sell ignored: not in_position")
+            )
+            log_trade("buy", price, 0.0, source, tf, SYMBOL_TV)
             commit(SYMBOL_TV)
             return "OK", 200
 
-        tv_sell = float(tv_price or 0.0)
-        winst_bedrag = 0.0
-        display_fill = tv_sell
 
-        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-            try:
-                ex = _mexc_live()
-                # veilige sell-amount bepalen
-                amt, info = _prepare_sell_amount(ex, SYMBOL_TV, pos_amount)
-                _dbg(f"[SELL PREP] {SYMBOL_TV} info={info}")
-                if amt <= 0.0:
-                    _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount}, free={info.get('free_amt')}) → dust")
-                    if pos_amount <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
-                        in_position = False
-                        entry_price = 0.0
-                        pos_amount = 0.0
-                        pos_quote = 0.0
-                        send_tg(
-                            f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n"
-                            f"🧠 Reden: dust_below_exchange_min\n"
-                            f"🪙 Restpositie intern gesloten (dust)\n"
-                            f"🕒 Tijd: {now_str()}"
-                        )
-                        log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
-                        commit(SYMBOL_TV)
-                    else:
-                        _dbg("[LIVE] leave as dust; no order placed")
-                    return "OK", 200
+    # === SELL ===
+    if action == "sell":
+        lock = SYMBOL_LOCKS.setdefault(SYMBOL_TV, Lock())
+        with lock:
+            if not in_position:
+                _dbg("sell ignored: not in_position")
+                commit(SYMBOL_TV)
+                return "OK", 200
 
-                # plaats order
-                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+            tv_sell = float(tv_price or 0.0)
+            winst_bedrag = 0.0
+            display_fill = tv_sell
 
-            except Exception as e_sell:
-                msg = str(e_sell).lower()
-                # één retry met minimaal toelaatbare amount
-                if "minimum amount" in msg or "precision" in msg or "min" in msg:
-                    min_retry = info.get("min_amt", 0.0)
-                    if info.get("free_amt", 0.0) >= min_retry and min_retry > 0:
-                        try:
-                            retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
-                            _dbg(f"[SELL RETRY] using min_amt={retry_amt}")
-                            order = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
-                        except Exception as e2:
-                            _dbg(f"[LIVE] SELL retry failed: {e2}")
+            # snapshots zodat idle_worker onze PnL niet beïnvloedt
+            pos_amount0 = float(pos_amount)
+            pos_quote0 = float(pos_quote)
+
+            if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+                try:
+                    ex = _mexc_live()
+                    # veilige sell-amount bepalen
+                    amt, info = _prepare_sell_amount(ex, SYMBOL_TV, pos_amount0)
+                    _dbg(f"[SELL PREP] {SYMBOL_TV} info={info}")
+                    if amt <= 0.0:
+                        _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount0}, free={info.get('free_amt')}) → dust")
+                        if pos_amount0 <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
+                            in_position = False
+                            entry_price = 0.0
+                            pos_amount = 0.0
+                            pos_quote = 0.0
+                            send_tg(f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n🧠 Reden: dust_below_exchange_min\n🪙 Restpositie intern gesloten (dust)\n🕒 Tijd: {now_str()}")
+                            log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
                             commit(SYMBOL_TV)
-                            return "OK", 200
-                else:
-                    _dbg(f"[LIVE] MEXC SELL error: {e_sell}")
-                    commit(SYMBOL_TV)
-                    return "OK", 200
+                        else:
+                            _dbg("[LIVE] leave as dust; no order placed")
+                        return "OK", 200
 
-            # ---- order opvullen en PnL berekenen ----
-            oid = order.get("id")
-            if oid:
-                for _ in range(3):
-                    try:
-                        time.sleep(0.25)
-                        o2 = ex.fetch_order(oid, SYMBOL_TV)
-                        if o2:
-                            order = {**order, **o2}
-                        if not order.get("trades"):
+                    # plaats order
+                    order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+
+                except Exception as e_sell:
+                    msg = str(e_sell).lower()
+                    # één retry met minimaal toelaatbare amount
+                    if "minimum amount" in msg or "precision" in msg or "min" in msg:
+                        min_retry = info.get("min_amt", 0.0)
+                        if info.get("free_amt", 0.0) >= min_retry and min_retry > 0:
                             try:
-                                trs = ex.fetch_order_trades(oid, SYMBOL_TV)
-                                if trs:
-                                    order["trades"] = trs
-                            except Exception:
-                                pass
-                        if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
-                            break
-                    except Exception:
-                        pass
+                                retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
+                                _dbg(f"[SELL RETRY] using min_amt={retry_amt}")
+                                order = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
+                            except Exception as e2:
+                                _dbg(f"[LIVE] SELL retry failed: {e2}")
+                                commit(SYMBOL_TV)
+                                return "OK", 200
+                    else:
+                        _dbg(f"[LIVE] MEXC SELL error: {e_sell}")
+                        commit(SYMBOL_TV)
+                        return "OK", 200
 
-            avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
-            display_fill = float(avg2)
-            filled = float(filled2)
+                # ---- order opvullen en PnL berekenen ----
+                oid = order.get("id")
+                if oid:
+                    for _ in range(3):
+                        try:
+                            time.sleep(0.25)
+                            o2 = ex.fetch_order(oid, SYMBOL_TV)
+                            if o2:
+                                order = {**order, **o2}
+                            if not order.get("trades"):
+                                try:
+                                    trs = ex.fetch_order_trades(oid, SYMBOL_TV)
+                                    if trs:
+                                        order["trades"] = trs
+                                except Exception:
+                                    pass
+                            if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
+                                break
+                        except Exception:
+                            pass
 
-            inleg_quote = float(pos_quote)
-            if pos_amount > 0 and filled < pos_amount:
-                inleg_quote = inleg_quote * (filled / pos_amount)
+                avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
+                display_fill = float(avg2)
+                filled = float(filled2)
 
-            revenue_net = float(net_out)
-            winst_bedrag = round(revenue_net - inleg_quote, 2)
+                # Inleg baseren op snapshot
+                inleg_quote = float(pos_quote0)
+                if pos_amount0 > 0 and filled < pos_amount0:
+                    inleg_quote = inleg_quote * (filled / pos_amount0)
 
-            _dbg(
-                f"[LIVE] MEXC SELL {SYMBOL_TV} id={order.get('id')} "
-                f"filled={filled} avg={display_fill} gross={gross_q} fee_q={fee_q} "
-                f"net_out={revenue_net} pnl={winst_bedrag}"
-            )
+                revenue_net = float(net_out)
+                winst_bedrag = round(revenue_net - inleg_quote, 2)
 
-        else:
-            if entry_price > 0:
-                verkoop_bedrag = price * get_budget(SYMBOL_TV) / entry_price
-                winst_bedrag = round(verkoop_bedrag - get_budget(SYMBOL_TV), 2)
+                _dbg(f"[LIVE] MEXC SELL {SYMBOL_TV} id={order.get('id')} filled={filled} avg={display_fill} gross={gross_q} fee_q={fee_q} net_out={revenue_net} pnl={winst_bedrag}")
 
-        # Boekhouding
-        if winst_bedrag > 0:
-            sparen += SAVINGS_SPLIT * winst_bedrag
-            capital += (1.0 - SAVINGS_SPLIT) * winst_bedrag
-        else:
-            capital += winst_bedrag
-
-        if capital < START_CAPITAL:
-            tekort = START_CAPITAL - capital
-            if sparen >= tekort:
-                sparen -= tekort
-                capital += tekort
-
-        # Positie bijwerken
-        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-            try:
-                filled  # type: ignore
-            except NameError:
-                filled = pos_amount
-            if pos_amount > 0 and filled < pos_amount:
-                factor = (pos_amount - filled) / pos_amount
-                pos_quote = round(pos_quote * factor, 6)
-                pos_amount = round(pos_amount - filled, 6)
-                in_position = pos_amount > REHYDRATE_MIN_XRP
-                entry_price = (pos_quote / pos_amount) if in_position and pos_amount > 0 else 0.0
             else:
+                if entry_price > 0:
+                    verkoop_bedrag = price * get_budget(SYMBOL_TV) / entry_price
+                    winst_bedrag = round(verkoop_bedrag - get_budget(SYMBOL_TV), 2)
+
+            # Boekhouding
+            if winst_bedrag > 0:
+                sparen += SAVINGS_SPLIT * winst_bedrag
+                capital += (1.0 - SAVINGS_SPLIT) * winst_bedrag
+            else:
+                capital += winst_bedrag
+
+            if capital < START_CAPITAL:
+                tekort = START_CAPITAL - capital
+                if sparen >= tekort:
+                    sparen -= tekort
+                    capital += tekort
+
+            # Positie bijwerken met snapshot (partial/full)
+            if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+                try:
+                    filled  # type: ignore
+                except NameError:
+                    filled = pos_amount0
+                if pos_amount0 > 0 and filled < pos_amount0:
+                    factor = (pos_amount0 - filled) / pos_amount0
+                    pos_quote = round(pos_quote0 * factor, 6)
+                    pos_amount = round(pos_amount0 - filled, 6)
+                    in_position = pos_amount > REHYDRATE_MIN_XRP
+                    entry_price = (pos_quote / pos_amount) if in_position and pos_amount > 0 else 0.0
+                else:
+                    pos_amount = 0.0
+                    pos_quote = 0.0
+                    in_position = False
+                    entry_price = 0.0
+            else:
+                in_position = False
                 pos_amount = 0.0
                 pos_quote = 0.0
-                in_position = False
                 entry_price = 0.0
-        else:
-            in_position = False
-            pos_amount = 0.0
-            pos_quote = 0.0
-            entry_price = 0.0
 
-        last_action_ts = time.time()
-        if LOCAL_TPSL_ENABLED:
-            tpsl_reset()
+            last_action_ts = time.time()
+            if LOCAL_TPSL_ENABLED:
+                tpsl_reset()
 
-        base_for_delta = tv_sell if tv_sell else display_fill
-        delta_txt = f"  (Δ {(display_fill / base_for_delta - 1) * 100:+.2f}%)" if base_for_delta else ""
-        resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
-        rest_txt = f"\n🪙 Resterend: {pos_amount:.4f} @ ~${entry_price:.6f}" if in_position else ""
+            base_for_delta = tv_sell if tv_sell else display_fill
+            delta_txt = f"  (Δ {(display_fill / base_for_delta - 1) * 100:+.2f}%)" if base_for_delta else ""
+            resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
+            rest_txt = f"\n🪙 Resterend: {pos_amount:.4f} @ ~${entry_price:.6f}" if in_position else ""
 
-        send_tg(
-            f"""📄 <b>[{SYMBOL_TV}] VERKOOP</b>
+            send_tg(
+                f"""📄 <b>[{SYMBOL_TV}] VERKOOP</b>
 📹 TV prijs: ${tv_sell:.6f}
 🎯 Fill (MEXC): ${display_fill:.6f}{delta_txt}
 🧠 Signaalbron: {source} | {advisor_reason}
@@ -1279,10 +1282,11 @@ def webhook():
 📈 Totale waarde: €{capital + sparen:.2f}
 🔐 Tradebedrag: €{get_budget(SYMBOL_TV):.2f}
 🔗 Tijd: {timestamp}{rest_txt}"""
-        )
-        log_trade("sell", display_fill, winst_bedrag, source, tf, SYMBOL_TV)
-        commit(SYMBOL_TV)
-        return "OK", 200
+            )
+            log_trade("sell", display_fill, winst_bedrag, source, tf, SYMBOL_TV)
+            commit(SYMBOL_TV)
+            return "OK", 200
+
 
 # --------------- Forced exits ---------------
 def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
@@ -1428,27 +1432,34 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
 
 
 def forced_exit_check(symbol_tv: str, last_price: float | None = None):
-    bind(symbol_tv)
-    if not in_position or entry_price <= 0:
-        return
-    if last_price is None:
-        try:
-            last_price, src = fetch_last_price_any(symbol_tv)
-        except Exception as e:
-            print(f"[PRICE] fetch fail all: {e}")
+    lock = SYMBOL_LOCKS.setdefault(symbol_tv, Lock())
+    with lock:
+        bind(symbol_tv)
+        if not in_position or entry_price <= 0:
+            commit(symbol_tv)
             return
-    # Hard SL (na arm)
-    if HARD_SL_PCT > 0 and entry_ts > 0 and (time.time() - entry_ts) >= HARD_SL_ARM_SEC:
-        if last_price <= entry_price * (1.0 - HARD_SL_PCT):
-            _do_forced_sell(last_price, f"hard_sl_{HARD_SL_PCT:.3%}")
+        if last_price is None:
+            try:
+                last_price, src = fetch_last_price_any(symbol_tv)
+            except Exception as e:
+                print(f"[PRICE] fetch fail all: {e}")
+                commit(symbol_tv)
+                return
+        # Hard SL (na arm)
+        if HARD_SL_PCT > 0 and entry_ts > 0 and (time.time() - entry_ts) >= HARD_SL_ARM_SEC:
+            if last_price <= entry_price * (1.0 - HARD_SL_PCT):
+                _do_forced_sell(last_price, f"hard_sl_{HARD_SL_PCT:.3%}")
+                commit(symbol_tv)
+                return
+        # Max hold
+        if MAX_HOLD_MIN > 0 and entry_ts > 0 and (time.time() - entry_ts) >= MAX_HOLD_MIN * 60:
+            _do_forced_sell(last_price, f"max_hold_{MAX_HOLD_MIN}m")
+            commit(symbol_tv)
             return
-    # Max hold
-    if MAX_HOLD_MIN > 0 and entry_ts > 0 and (time.time() - entry_ts) >= MAX_HOLD_MIN * 60:
-        _do_forced_sell(last_price, f"max_hold_{MAX_HOLD_MIN}m")
-        return
-    # Lokale TPSL
-    local_tpsl_check(last_price)
-    commit(symbol_tv)
+        # Lokale TPSL
+        local_tpsl_check(last_price)
+        commit(symbol_tv)
+
 
 
 # --------------- Reports ---------------
