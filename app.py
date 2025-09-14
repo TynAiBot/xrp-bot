@@ -58,6 +58,70 @@ SYMBOL_TV = "XRP/USDT"  # ccxt notatie
 SYMBOL_STR = "XRPUSDT"  # string voor advisor/logs
 
 START_CAPITAL = float(os.getenv("START_CAPITAL", "500"))
+
+# === Multi-pair setup ===
+TRADEABLE = {           # budget per paar (USDT)
+    "XRP/USDT": float(os.getenv("BUDGET_XRP", "500")),
+    "WLFI/USDT": float(os.getenv("BUDGET_WLFI", "500")),
+}
+
+# Huidige 'actieve' symbol in context (wordt per webhook gezet)
+CURRENT_SYMBOL = "XRP/USDT"
+
+def _sym_str(sym: str) -> str:
+    return (sym or "XRP/USDT").replace("/", "").upper()
+
+CURRENT_SYMBOL_STR = _sym_str(CURRENT_SYMBOL)
+
+# Per-paar runtime state
+STATE = {
+    sym: {
+        "in_position": False,
+        "entry_price": 0.0,
+        "entry_ts": 0.0,
+        "last_action_ts": 0.0,
+        "pos_amount": 0.0,
+        "pos_quote": 0.0,
+    } for sym in TRADEABLE
+}
+
+def get_budget(sym: str) -> float:
+    return float(TRADEABLE.get(sym, float(os.getenv("START_CAPITAL", "500"))))
+
+def parse_symbol_from_tv(s):
+    # TV kan 'XRPUSDT' of 'MEXC:XRPUSDT' sturen
+    if not s:
+        return CURRENT_SYMBOL
+    s = str(s).upper().replace("MEXC:", "").replace("/", "").strip()
+    if s.endswith("USDT"):
+        base = s[:-4]
+        return f"{base}/USDT"
+    return s
+
+def bind(sym: str):
+    # Laad STATE[sym] -> module globals
+    global CURRENT_SYMBOL, CURRENT_SYMBOL_STR
+    global in_position, entry_price, entry_ts, last_action_ts, pos_amount, pos_quote
+    CURRENT_SYMBOL = sym
+    CURRENT_SYMBOL_STR = _sym_str(sym)
+    S = STATE[sym]
+    in_position    = bool(S["in_position"])
+    entry_price    = float(S["entry_price"])
+    entry_ts       = float(S["entry_ts"])
+    last_action_ts = float(S["last_action_ts"])
+    pos_amount     = float(S["pos_amount"])
+    pos_quote      = float(S["pos_quote"])
+
+def commit(sym: str):
+    # Schrijf module globals -> STATE[sym]
+    STATE[sym].update({
+        "in_position":    bool(in_position),
+        "entry_price":    float(entry_price),
+        "entry_ts":       float(entry_ts),
+        "last_action_ts": float(last_action_ts),
+        "pos_amount":     float(pos_amount),
+        "pos_quote":      float(pos_quote),
+    })
 SPAREN_START = float(os.getenv("SPAREN_START", "500"))
 
 LIVE_MODE = env_bool("LIVE_MODE", True)
@@ -459,20 +523,17 @@ def _ema(values, n):
         ema = v * k + ema * (1 - k)
     return ema
 
-
-def trend_ok(price: float) -> Tuple[bool, float]:
+def trend_ok(price: float, symbol_tv: str = None):
+    symbol_tv = symbol_tv or CURRENT_SYMBOL
     try:
         if not USE_TREND_FILTER:
             return True, float("nan")
-
         n = max(5, int(TREND_MA_LEN))
-        ohlcv, src = fetch_ohlcv_any(SYMBOL_TV, timeframe=TREND_TF, limit=n + 20)
+        ohlcv, src = fetch_ohlcv_any(symbol_tv, timeframe=TREND_TF, limit=n + 20)
         closes = [float(c[4]) for c in ohlcv]
         if len(closes) < n:
             return True, float("nan")
-
         ma = _ema(closes, n) if TREND_MA_TYPE == "EMA" else sum(closes[-n:]) / float(n)
-
         ok_gate = True
         mode = TREND_MODE
         if mode == "hard":
@@ -481,36 +542,13 @@ def trend_ok(price: float) -> Tuple[bool, float]:
             ok_gate = price >= ma * (1.0 - max(0.0, TREND_SOFT_TOL))
         else:
             ok_gate = True
-
         if ok_gate and TREND_SLOPE_LOOKBACK > 0 and len(closes) > TREND_SLOPE_LOOKBACK:
             past = closes[-(TREND_SLOPE_LOOKBACK + 1)]
             ok_gate = (closes[-1] - past) >= 0
-
         return ok_gate, (ma if ma is not None else float("nan"))
     except Exception as e:
         print(f"[TREND] fetch fail: {e}")
         return True, float("nan")
-
-
-# -----------------------
-# Persistente log helpers
-# -----------------------
-def load_trades():
-    global trade_log
-    try:
-        if os.path.exists(TRADES_FILE):
-            with open(TRADES_FILE, "r", encoding="utf-8") as f:
-                trade_log = json.load(f)
-                if not isinstance(trade_log, list):
-                    trade_log = []
-            print(
-                f"[LOG] geladen: {len(trade_log)} trades uit {TRADES_FILE}", flush=True
-            )
-        else:
-            trade_log = []
-    except Exception as e:
-        print(f"[LOG] load error: {e}", flush=True)
-        trade_log = []
 
 
 def save_trades():
@@ -637,19 +675,12 @@ def _qty_for_quote(ex, symbol, quote_amount, price):
 
 # --- LIVE order helpers ------------------------------------------------------
 
-def _place_mexc_market(side: str, quote_amount_usd: float, ref_price: float):
+def _place_mexc_market(symbol: str, side: str, quote_amount_usd: float, ref_price: float):
     ex = _mexc_live()
-    symbol = SYMBOL_TV
-
-    # Bepaal amount in base (XRP) op basis van quote budget
     amount = _qty_for_quote(ex, symbol, quote_amount_usd, ref_price)
     if amount <= 0:
         raise RuntimeError("Calculated amount <= 0")
-
-    # Plaats marktorder
     order = ex.create_order(symbol, "market", side, amount)
-
-    # Definitieve fills/fees ophalen (sommige velden komen pas na fetch_order)
     oid = order.get("id")
     if oid:
         for _ in range(2):
@@ -661,7 +692,6 @@ def _place_mexc_market(side: str, quote_amount_usd: float, ref_price: float):
                     break
             except Exception:
                 pass
-
     avg = order.get("average") or order.get("price") or ref_price
     filled = order.get("filled") or amount
     return float(avg), float(filled), order
@@ -806,95 +836,87 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
     return float(avg), float(filled), order
 
 # Rehydrate live positie (spot)
-def _rehydrate_from_mexc():
-    global in_position, pos_amount, entry_price, pos_quote
+
+def _rehydrate_from_mexc_symbol(symbol: str) -> bool:
+    """Vul STATE[symbol] vanuit live MEXC balans & trades."""
     try:
         ex = _mexc_live()
         bal = ex.fetch_balance()
-        xrp = bal.get("XRP") or {}
-        total_amt = float(xrp.get("total") or 0.0)
+        base = (ex.market(symbol).get("base") or symbol.split("/")[0]).upper()
+        tot  = float((bal.get(base) or {}).get("total") or 0.0)
 
-        if total_amt >= REHYDRATE_MIN_XRP:
-            # Ruwe positie
-            pos_amount = float(ex.amount_to_precision(SYMBOL_TV, total_amt))
-            in_position = True
-            entry_price = 0.0
+        if tot < REHYDRATE_MIN_XRP:
+            _dbg(f"[REHYDRATE] {symbol} dust {tot} -> ignore")
+            STATE[symbol].update({
+                "in_position": False, "entry_price": 0.0, "pos_amount": 0.0, "pos_quote": 0.0
+            })
+            return False
 
-            # Schat entry uit recente trades (7 dagen)
+        pos_amount = float(ex.amount_to_precision(symbol, tot))
+        entry_price = 0.0
+
+        # 7d trades om entry te schatten (incl. BUY fees in quote)
+        try:
+            since  = int((time.time() - 7 * 24 * 3600) * 1000)
+            trades = ex.fetch_my_trades(symbol, since=since)
+            net_base = 0.0
+            cost_q   = 0.0
+            fee_buy_q= 0.0
+            base_ccy = (ex.market(symbol).get("base") or base).upper()
+            for t in trades:
+                amt  = float(t.get("amount") or 0.0)
+                pr   = float(t.get("price") or 0.0)
+                side = (t.get("side") or "").lower()
+                if side == "buy":
+                    net_base += amt
+                    cost_q   += amt * pr
+                    ff = t.get("fee") or {}
+                    try:
+                        cur = str(ff.get("currency", "")).upper()
+                        val = float(ff.get("cost") or 0.0)
+                        if val > 0:
+                            if cur in {"USDT","USD"}: fee_buy_q += val
+                            elif cur == base_ccy and pr > 0: fee_buy_q += val * pr
+                    except Exception: pass
+                elif side == "sell":
+                    net_base -= amt
+                    cost_q   -= amt * pr
+                if net_base <= 1e-12:
+                    net_base, cost_q, fee_buy_q = 0.0, 0.0, 0.0
+            if net_base > 0 and (cost_q + fee_buy_q) > 0:
+                entry_price = (cost_q + fee_buy_q) / net_base
+        except Exception as e2:
+            _dbg(f"[REHYDRATE] trade-based entry calc failed {symbol}: {e2}")
+
+        if entry_price <= 0.0:
             try:
-                since = int((time.time() - 7 * 24 * 3600) * 1000)
-                trades = ex.fetch_my_trades(SYMBOL_TV, since=since)
+                tk = ex.fetch_ticker(symbol)
+                entry_price = float(tk.get("last") or 0.0)
+            except Exception:
+                entry_price = 0.0
 
-                net_base = 0.0     # netto gekochte XRP sinds laatste flatten
-                cost_q   = 0.0     # som van (amount * price) voor buys minus sells
-                fee_buy_q = 0.0    # alleen buy-fees in USDT (of base→USDT) tellen mee voor entry
-                base_ccy = (ex.market(SYMBOL_TV).get("base") or "XRP").upper()
-
-                for t in trades:
-                    amt  = float(t.get("amount") or 0.0)
-                    pr   = float(t.get("price") or 0.0)
-                    side = (t.get("side") or "").lower()
-
-                    if side == "buy":
-                        net_base += amt
-                        cost_q   += amt * pr
-                        # fee meenemen als die in USDT is (of base→USDT)
-                        ff = t.get("fee") or {}
-                        try:
-                            cur = str(ff.get("currency", "")).upper()
-                            val = float(ff.get("cost") or 0.0)
-                            if val > 0:
-                                if cur in {"USDT", "USD"}:
-                                    fee_buy_q += val
-                                elif cur == base_ccy and pr > 0:
-                                    fee_buy_q += val * pr
-                        except Exception:
-                            pass
-
-                    elif side == "sell":
-                        net_base -= amt
-                        cost_q   -= amt * pr
-                        # sell-fees horen bij de verkochte kant → niet in entry van de resterende long
-
-                    # Als we tussendoor volledig vlak gingen, reset accumulators
-                    if net_base <= 1e-12:
-                        net_base, cost_q, fee_buy_q = 0.0, 0.0, 0.0
-
-                if net_base > 0 and (cost_q + fee_buy_q) > 0:
-                    entry_price = (cost_q + fee_buy_q) / net_base
-
-            except Exception as e2:
-                _dbg(f"[REHYDRATE] trade-based entry calc failed: {e2}")
-
-            # Fallback als entry onbekend bleef (zou zelden gebeuren)
-            if entry_price <= 0.0:
-                try:
-                    tk = ex.fetch_ticker(SYMBOL_TV)
-                    entry_price = float(tk.get("last") or 0.0)
-                except Exception:
-                    entry_price = 0.0
-
-            # >>> Belangrijk: stel pos_quote af op entry * amount (netto inleg-benadering)
-            pos_quote = round(entry_price * pos_amount, 6)
-
-            _dbg(f"[REHYDRATE] detected XRP position amt={pos_amount}, entry≈{entry_price}, pos_quote≈{pos_quote}")
-            return True
-
-        else:
-            _dbg(f"[REHYDRATE] small dust {total_amt} XRP -> ignore")
-            # Dust negeren → state echt FLAT zetten
-            in_position = False
-            pos_amount  = 0.0
-            pos_quote   = 0.0
-            entry_price = 0.0
+        pos_quote = round(entry_price * pos_amount, 6)
+        STATE[symbol].update({
+            "in_position": True,
+            "entry_price": entry_price,
+            "entry_ts":    time.time(),
+            "last_action_ts": time.time(),
+            "pos_amount":  pos_amount,
+            "pos_quote":   pos_quote,
+        })
+        _dbg(f"[REHYDRATE] {symbol} amt={pos_amount}, entry≈{entry_price}, pos_quote≈{pos_quote}")
+        return True
 
     except Exception as e:
-        _dbg(f"[REHYDRATE] failed: {e}")
+        _dbg(f"[REHYDRATE] failed {symbol}: {e}")
+        STATE[symbol].update({
+            "in_position": False, "entry_price": 0.0, "pos_amount": 0.0, "pos_quote": 0.0
+        })
+        return False
 
-    return False
-
-
-# --- LIVE order helpers ------------------------------------------------------
+def _rehydrate_all_symbols():
+    for sym in TRADEABLE:
+        _rehydrate_from_mexc_symbol(sym)
 
 def _place_mexc_market(side: str, quote_amount_usd: float, ref_price: float):
     ex = _mexc_live()
