@@ -109,6 +109,10 @@ capital = START_CAPITAL
 sparen = float(os.getenv("SPAREN_START", "500"))
 tpsl_state = _fresh_tpsl()
 SYMBOL_LOCKS = {s: Lock() for s in TRADEABLE}
+# Anti-spam voor forced-sell meldingen
+FORCED_WARN_TS: Dict[str, float] = {}
+FORCED_WARN_COOLDOWN_S = env_int("FORCED_WARN_COOLDOWN_S", 60)  # seconden
+
 
 # De-dup window & per-key timestamp
 MIN_TRADE_COOLDOWN_S = env_int("MIN_TRADE_COOLDOWN_S", 0)  # user: vaak 0s
@@ -1296,7 +1300,7 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
     SYMBOL_TV = CURRENT_SYMBOL
     winst_bedrag = 0.0
     display_fill = float(price or 0.0)
-    amt_before = float(pos_amount)
+    amt_before   = float(pos_amount)
     quote_before = float(pos_quote)
 
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
@@ -1304,78 +1308,103 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
             ex = _mexc_live()
             amt, info = _prepare_sell_amount(ex, SYMBOL_TV, amt_before)
             _dbg(f"[FORCED SELL PREP] {SYMBOL_TV} info={info}")
-            if amt <= 0.0:
-                _dbg(f"[LIVE] FORCED SELL skipped: <min_amt (pos={pos_amount}, free={info.get('free_amt')}) → dust")
-                if amt_before <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
-                    in_position = False
-                    entry_price = 0.0
-                    pos_amount = 0.0
-                    pos_quote = 0.0
-                    send_tg(f"🚨 <b>[{SYMBOL_TV}] FORCED SELL</b>\n🧠 Reden: {reason} / dust_below_exchange_min\n🪙 Restpositie intern gesloten (dust)\n🔗 Tijd: {now_str()}")
-                    log_trade("sell_forced", display_fill, 0.0, source, tf, SYMBOL_TV)
+
+            free_amt = float(info.get("free_amt") or 0.0)
+            min_amt  = float(info.get("min_amt")  or 0.0)
+
+            # Geen vrij saldo op de beurs → interne reconcile en stoppen
+            if free_amt <= 0.0:
+                _dbg(f"[LIVE] FORCED SELL reconcile: exchange free=0 → sluit intern positie")
+                in_position = False
+                entry_price = 0.0
+                pos_amount  = 0.0
+                pos_quote   = 0.0
+                commit(SYMBOL_TV)
                 return False
 
-            try:
-                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
-            except Exception as e_sell:
-                msg = str(e_sell).lower()
-                if "minimum amount" in msg or "precision" in msg or "min" in msg:
-                    min_retry = info.get("min_amt", 0.0)
-                    if info.get("free_amt", 0.0) >= min_retry and min_retry > 0:
-                        try:
-                            retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
-                            _dbg(f"[FORCED SELL RETRY] using min_amt={retry_amt}")
-                            order = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
-                        except Exception as e2:
-                            _dbg(f"[LIVE] FORCED SELL retry failed: {e2}")
-                            return False
-                else:
-                    _dbg(f"[LIVE] MEXC FORCED SELL error: {e_sell}")
-                    return False
+            # Vrij saldo onder minimum → hoogstens 1x/min loggen, niet blijven spammen
+            if free_amt < max(min_amt, REHYDRATE_MIN_XRP):
+                t_last = FORCED_WARN_TS.get(SYMBOL_TV, 0.0)
+                if time.time() - t_last >= FORCED_WARN_COOLDOWN_S:
+                    _dbg(f"[LIVE] FORCED SELL skipped: free<{min_amt} (free={free_amt}) → dust")
+                    FORCED_WARN_TS[SYMBOL_TV] = time.time()
+                return False
 
+            # Plaats order met veilige amount (amt komt al uit _prepare_sell_amount)
             order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
 
-            oid = order.get("id")
-            if oid:
-                for _ in range(3):
-                    try:
-                        time.sleep(0.25)
-                        o2 = ex.fetch_order(oid, SYMBOL_TV)
-                        if o2:
-                            order = {**order, **o2}
-                        if not order.get("trades"):
-                            try:
-                                trs = ex.fetch_order_trades(oid, SYMBOL_TV)
-                                if trs:
-                                    order["trades"] = trs
-                            except Exception:
-                                pass
-                        if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
-                            break
-                    except Exception:
-                        pass
+        except Exception as e_sell:
+            msg_low = str(e_sell).lower()
+            # MEXC 'Oversold' -> positie bestaat niet meer op de beurs: sluit intern en stop
+            if "oversold" in msg_low or "code\":30005" in msg_low:
+                _dbg(f"[LIVE] FORCED SELL reconcile on Oversold → sluit intern positie")
+                in_position = False
+                entry_price = 0.0
+                pos_amount  = 0.0
+                pos_quote   = 0.0
+                commit(SYMBOL_TV)
+                return False
 
-            avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
-            display_fill = float(avg2)
-            filled = float(filled2)
+            # Eén retry met min_amt indien applicable
+            if "minimum amount" in msg_low or "precision" in msg_low or "min" in msg_low:
+                try:
+                    ex = _mexc_live()
+                    min_retry = float(info.get("min_amt", 0.0))
+                    free_amt  = float(info.get("free_amt", 0.0))
+                    if free_amt >= min_retry and min_retry > 0:
+                        retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
+                        _dbg(f"[FORCED SELL RETRY] using min_amt={retry_amt}")
+                        order = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
+                    else:
+                        _dbg(f"[LIVE] FORCED SELL retry skipped: free<{min_retry}")
+                        return False
+                except Exception as e2:
+                    _dbg(f"[LIVE] FORCED SELL retry failed: {e2}")
+                    return False
+            else:
+                _dbg(f"[LIVE] MEXC FORCED SELL error: {e_sell}")
+                return False
 
-            if amt_before > 0 and filled < amt_before:
-                quote_before = quote_before * (filled / amt_before)
+        # ---- order opvullen en PnL berekenen ----
+        oid = order.get("id")
+        if oid:
+            for _ in range(3):
+                try:
+                    time.sleep(0.25)
+                    o2 = ex.fetch_order(oid, SYMBOL_TV)
+                    if o2:
+                        order = {**order, **o2}
+                    if not order.get("trades"):
+                        try:
+                            trs = ex.fetch_order_trades(oid, SYMBOL_TV)
+                            if trs:
+                                order["trades"] = trs
+                        except Exception:
+                            pass
+                    if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
+                        break
+                except Exception:
+                    pass
 
-            revenue_net = float(net_out)
-            winst_bedrag = round(revenue_net - quote_before, 2)
-            _dbg(f"[LIVE] MEXC FORCED SELL {SYMBOL_TV} id={order.get('id')} filled={filled} avg={display_fill} net_out={revenue_net} pnl={winst_bedrag}")
-        except Exception as e:
-            _dbg(f"[LIVE] MEXC FORCED SELL error: {e}")
-            return False
+        avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
+        display_fill = float(avg2)
+        filled       = float(filled2)
+
+        if amt_before > 0 and filled < amt_before:
+            quote_before = quote_before * (filled / amt_before)
+
+        revenue_net  = float(net_out)
+        winst_bedrag = round(revenue_net - quote_before, 2)
+        _dbg(f"[LIVE] MEXC FORCED SELL {SYMBOL_TV} id={order.get('id')} filled={filled} avg={display_fill} net_out={revenue_net} pnl={winst_bedrag}")
+
     else:
         if entry_price > 0:
             verkoop_bedrag = price * get_budget(SYMBOL_TV) / entry_price
-            winst_bedrag = round(verkoop_bedrag - get_budget(SYMBOL_TV), 2)
+            winst_bedrag   = round(verkoop_bedrag - get_budget(SYMBOL_TV), 2)
 
     # Boekhouding
     if winst_bedrag > 0:
-        sparen += SAVINGS_SPLIT * winst_bedrag
+        sparen  += SAVINGS_SPLIT * winst_bedrag
         capital += (1.0 - SAVINGS_SPLIT) * winst_bedrag
     else:
         capital += winst_bedrag
@@ -1383,10 +1412,10 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
     if capital < START_CAPITAL:
         tekort = START_CAPITAL - capital
         if sparen >= tekort:
-            sparen -= tekort
+            sparen  -= tekort
             capital += tekort
 
-    # Positie updaten
+    # Positie bijwerken
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
         try:
             filled  # type: ignore
@@ -1394,19 +1423,19 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
             filled = amt_before
         if amt_before > 0 and filled < amt_before:
             sold_quote = round(quote_before, 6)
-            pos_quote = round(max(0.0, pos_quote - sold_quote), 6)
+            pos_quote  = round(max(0.0, pos_quote - sold_quote), 6)
             pos_amount = round(max(0.0, amt_before - filled), 6)
             in_position = pos_amount > REHYDRATE_MIN_XRP
             entry_price = (pos_quote / pos_amount) if in_position and pos_amount > 0 else 0.0
         else:
-            pos_amount = 0.0
-            pos_quote = 0.0
+            pos_amount  = 0.0
+            pos_quote   = 0.0
             in_position = False
             entry_price = 0.0
     else:
         in_position = False
-        pos_amount = 0.0
-        pos_quote = 0.0
+        pos_amount  = 0.0
+        pos_quote   = 0.0
         entry_price = 0.0
 
     last_action_ts = time.time()
@@ -1428,7 +1457,6 @@ def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: 
     log_trade("sell_forced", display_fill, winst_bedrag, source, tf, SYMBOL_TV)
     commit(SYMBOL_TV)
     return True
-
 
 def forced_exit_check(symbol_tv: str, last_price: float | None = None):
     lock = SYMBOL_LOCKS.setdefault(symbol_tv, Lock())
