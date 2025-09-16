@@ -1177,28 +1177,33 @@ def webhook():
             pos_amount0 = float(pos_amount)
             pos_quote0  = float(pos_quote)
 
-            if LIVE_MODE and LIVE_EXCHANGE == "mexc":
-                try:
-                    ex = _mexc_live()
-                    # veilige sell-amount bepalen
-                    amt, info = _prepare_sell_amount(ex, SYMBOL_TV, pos_amount0)
-                    _dbg(f"[SELL PREP] {SYMBOL_TV} info={info}")
-                    if amt <= 0.0:
-                        _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount0}, free={info.get('free_amt')}) → dust")
-                        if pos_amount0 <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
-                            in_position = False
-                            entry_price = 0.0
-                            pos_amount  = 0.0
-                            pos_quote   = 0.0
-                            send_tg(f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n🧠 Reden: dust_below_exchange_min\n🪙 Restpositie intern gesloten (dust)\n🕒 Tijd: {now_str()}")
-                            log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
-                            commit(SYMBOL_TV)
-                        else:
-                            _dbg("[LIVE] leave as dust; no order placed")
-                        return "OK", 200
+        if LIVE_MODE and LIVE_EXCHANGE == "mexc":
+            try:
+                ex = _mexc_live()
+                # veilige sell-amount bepalen
+                amt, info = _prepare_sell_amount(ex, SYMBOL_TV, pos_amount0)
+                _dbg(f"[SELL PREP] {SYMBOL_TV} info={info}")
 
-                    # plaats order
-                                   # plaats order
+                if amt <= 0.0:
+                    _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount0}, free={info.get('free_amt')}) → dust")
+                    if pos_amount0 <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
+                        in_position = False
+                        entry_price = 0.0
+                        pos_amount  = 0.0
+                        pos_quote   = 0.0
+                        send_tg(
+                            f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n"
+                            f"🧠 Reden: dust_below_exchange_min\n"
+                            f"🪙 Restpositie intern gesloten (dust)\n"
+                            f"🕒 Tijd: {now_str()}"
+                        )
+                        log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
+                        commit(SYMBOL_TV)
+                    else:
+                        _dbg("[LIVE] leave as dust; no order placed")
+                    return "OK", 200
+
+                # plaats order
                 order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
 
                 # FAST_FILL: sla fetch loops over en vul minimale velden
@@ -1209,7 +1214,7 @@ def webhook():
                     order.setdefault("average", tv_sell)
                     order.setdefault("cost", amt * max(tv_sell, 1e-12))
                 else:
-                    # ---- order opvullen en PnL berekenen ----
+                    # ---- order opvullen ----
                     oid = order.get("id")
                     if oid:
                         for _ in range(3):
@@ -1230,6 +1235,24 @@ def webhook():
                             except Exception:
                                 pass
 
+            except Exception as e_sell:
+                msg = str(e_sell).lower()
+                # één retry met minimaal toelaatbare amount
+                if "minimum amount" in msg or "precision" in msg or "min" in msg:
+                    min_retry = info.get("min_amt", 0.0)
+                    if info.get("free_amt", 0.0) >= min_retry and min_retry > 0:
+                        try:
+                            retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
+                            _dbg(f"[SELL RETRY] using min_amt={retry_amt}")
+                            order = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
+                        except Exception as e2:
+                            _dbg(f"[LIVE] SELL retry failed: {e2}")
+                            commit(SYMBOL_TV)
+                            return "OK", 200
+                else:
+                    _dbg(f"[LIVE] MEXC SELL error: {e_sell}")
+                    commit(SYMBOL_TV)
+                    return "OK", 200
 
                 avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
                 display_fill = float(avg2)
