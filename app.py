@@ -116,7 +116,7 @@ FORCED_WARN_COOLDOWN_S = env_int("FORCED_WARN_COOLDOWN_S", 60)  # seconden
 
 # De-dup window & per-key timestamp
 MIN_TRADE_COOLDOWN_S = env_int("MIN_TRADE_COOLDOWN_S", 0)  # user: vaak 0s
-DEDUP_WINDOW_S = env_int("DEDUP_WINDOW_S", 15)
+DEDUP_WINDOW_S = env_int("DEDUP_WINDOW_S", 1)
 last_signal_key_ts: Dict[tuple, float] = {}  # (symbol, action, source, round(price,4), tf) -> ts
 
 # Winstverdeling & guardrails
@@ -188,6 +188,10 @@ if not TG_TOKEN or not TG_CHAT_ID:
 trend_exchange = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "spot"}}) if USE_TREND_FILTER else None
 
 DEBUG_SIG = env_bool("DEBUG_SIG", True)
+
+# --- Speed toggles / client cache ---
+FAST_FILL = env_bool("FAST_FILL", True)   # True = skip extra fetch loops na order voor snelheid
+EX_LIVE = None                            # cached ccxt client (MEXC)
 
 
 def _dbg(msg: str):
@@ -487,17 +491,31 @@ def fetch_last_price_any(symbol_tv="XRP/USDT"):
             errs.append(f"{name}: {e}")
     raise Exception(" | ".join(errs))
 
-
 # --------------- LIVE MEXC ----------------
 def _mexc_live():
-    ak = os.getenv("MEXC_API_KEY", "")
-    sk = os.getenv("MEXC_API_SECRET", "")
+    global EX_LIVE
+    ak = os.getenv("MEXC_API_KEY", "") or os.getenv("MEXC_KEY", "")
+    sk = os.getenv("MEXC_API_SECRET", "") or os.getenv("MEXC_SECRET", "")
     if not ak or not sk:
         raise RuntimeError("MEXC_API_KEY/SECRET ontbreken")
-    ex = ccxt.mexc({"apiKey": ak, "secret": sk, "enableRateLimit": True, "options": {"defaultType": "spot"}})
-    ex.load_markets()
-    return ex
 
+    if EX_LIVE is not None:
+        return EX_LIVE
+
+    ex = ccxt.mexc({
+        "apiKey": ak,
+        "secret": sk,
+        "enableRateLimit": False,  # sneller; let op je alert-frequentie
+        "timeout": 3000,
+        "options": {"defaultType": "spot", "recvWindow": 5000},
+    })
+    try:
+        ex.load_markets()
+    except Exception as e:
+        _dbg(f"[MEXC] load_markets error: {e}")
+
+    EX_LIVE = ex
+    return EX_LIVE
 
 def _qty_for_quote(ex, symbol, quote_amount, price):
     raw = max(float(quote_amount) / float(price), 0.0)
@@ -631,7 +649,18 @@ def _place_mexc_market(symbol: str, side: str, quote_amount_usd: float, ref_pric
     amount = _qty_for_quote(ex, symbol, quote_amount_usd, ref_price)
     if amount <= 0:
         raise RuntimeError("Calculated amount <= 0")
+
     order = ex.create_order(symbol, "market", side, amount)
+
+    if FAST_FILL:
+        # Snel pad: geen fetch loops; vul basisvelden zodat _order_quote_breakdown kan rekenen
+        order.setdefault("amount", amount)
+        order.setdefault("filled", amount)     # market -> meestal full fill
+        order.setdefault("price", ref_price)
+        order.setdefault("average", ref_price)
+        order.setdefault("cost", amount * ref_price)
+        return order
+
     oid = order.get("id")
     if oid:
         for _ in range(3):
@@ -652,6 +681,7 @@ def _place_mexc_market(symbol: str, side: str, quote_amount_usd: float, ref_pric
             except Exception:
                 pass
     return order
+
 
 
 # --------------- TPSL helpers ---------------
@@ -1168,47 +1198,38 @@ def webhook():
                         return "OK", 200
 
                     # plaats order
-                    order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                                   # plaats order
+                order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
 
-                except Exception as e_sell:
-                    msg = str(e_sell).lower()
-                    # één retry met minimaal toelaatbare amount
-                    if "minimum amount" in msg or "precision" in msg or "min" in msg:
-                        min_retry = info.get("min_amt", 0.0)
-                        if info.get("free_amt", 0.0) >= min_retry and min_retry > 0:
+                # FAST_FILL: sla fetch loops over en vul minimale velden
+                if FAST_FILL:
+                    order.setdefault("amount", amt)
+                    order.setdefault("filled", amt)
+                    order.setdefault("price", tv_sell)
+                    order.setdefault("average", tv_sell)
+                    order.setdefault("cost", amt * max(tv_sell, 1e-12))
+                else:
+                    # ---- order opvullen en PnL berekenen ----
+                    oid = order.get("id")
+                    if oid:
+                        for _ in range(3):
                             try:
-                                retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
-                                _dbg(f"[SELL RETRY] using min_amt={retry_amt}")
-                                order = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
-                            except Exception as e2:
-                                _dbg(f"[LIVE] SELL retry failed: {e2}")
-                                commit(SYMBOL_TV)
-                                return "OK", 200
-                    else:
-                        _dbg(f"[LIVE] MEXC SELL error: {e_sell}")
-                        commit(SYMBOL_TV)
-                        return "OK", 200
+                                time.sleep(0.25)
+                                o2 = ex.fetch_order(oid, SYMBOL_TV)
+                                if o2:
+                                    order = {**order, **o2}
+                                if not order.get("trades"):
+                                    try:
+                                        trs = ex.fetch_order_trades(oid, SYMBOL_TV)
+                                        if trs:
+                                            order["trades"] = trs
+                                    except Exception:
+                                        pass
+                                if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
+                                    break
+                            except Exception:
+                                pass
 
-                # ---- order opvullen en PnL berekenen ----
-                oid = order.get("id")
-                if oid:
-                    for _ in range(3):
-                        try:
-                            time.sleep(0.25)
-                            o2 = ex.fetch_order(oid, SYMBOL_TV)
-                            if o2:
-                                order = {**order, **o2}
-                            if not order.get("trades"):
-                                try:
-                                    trs = ex.fetch_order_trades(oid, SYMBOL_TV)
-                                    if trs:
-                                        order["trades"] = trs
-                                except Exception:
-                                    pass
-                            if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
-                                break
-                        except Exception:
-                            pass
 
                 avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
                 display_fill = float(avg2)
@@ -1551,8 +1572,21 @@ if __name__ == "__main__":
     except Exception as e:
         _dbg(f"[REHYDRATE] all symbols failed: {e}")
 
+    # warm-up: cache de MEXC client zodat de eerste order geen extra latency heeft
+    def _warmup():
+        try:
+            _mexc_live()
+            _dbg("[WARMUP] MEXC client ready")
+        except Exception as e:
+            _dbg(f"[WARMUP] MEXC failed: {e}")
+
+    warmup_thread = Thread(target=_warmup, daemon=True)
+    warmup_thread.start()
+
     # start idle thread
-    Thread(target=idle_worker, daemon=True).start()
+    idle_thread = Thread(target=idle_worker, daemon=True)
+    idle_thread.start()
 
     _dbg(f"✅ Webhook server op http://0.0.0.0:{PORT}/webhook — symbols: {list(TRADEABLE.keys())}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
