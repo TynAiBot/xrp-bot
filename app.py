@@ -1244,7 +1244,7 @@ def webhook():
             ts        = timestamp or now_str()
 
             send_tg(
-                f\"\"\"🟢 <b>[{SYMBOL_TV}] AANKOOP</b>
+                f"""🟢 <b>[{SYMBOL_TV}] AANKOOP</b>
 📹 TV prijs: ${tv_show:.6f}
 🎯 Fill (MEXC): ${float(price or 0.0):.6f}{delta_txt}
 🧠 Signaalbron: {source_h} | {advisor_h}
@@ -1253,7 +1253,7 @@ def webhook():
 💼 Spaarrekening: €{sparen:.2f}
 📈 Totale waarde: €{capital + sparen:.2f}
 🔐 Tradebedrag: €{TRADE_BUDGET:.2f}
-🔗 Tijd: {ts}\"\"\"
+🔗 Tijd: {ts}"""
             )
             log_trade("buy", float(price or 0.0), 0.0, source, tf, SYMBOL_TV)
             commit(SYMBOL_TV)
@@ -1500,7 +1500,7 @@ def webhook():
             ts       = timestamp or now_str()
 
             send_tg(
-                f\"\"\"📄 <b>[{SYMBOL_TV}] VERKOOP</b>
+                f"""📄 <b>[{SYMBOL_TV}] VERKOOP</b>
 📹 TV prijs: ${tv_show:.6f}
 🎯 Fill (MEXC): ${display_fill:.6f}{delta_txt}
 🧠 Signaalbron: {source_h} | {advisor_h}
@@ -1510,7 +1510,7 @@ def webhook():
 📈 {resultaat}: €{winst_bedrag:.2f}
 📈 Totale waarde: €{capital + sparen:.2f}
 🔐 Tradebedrag: €{get_budget(SYMBOL_TV):.2f}
-🔗 Tijd: {ts}{rest_txt}\"\"\"
+🔗 Tijd: {ts}{rest_txt}"""
             )
             log_trade("sell", display_fill, winst_bedrag, source, tf, SYMBOL_TV)
             commit(SYMBOL_TV)
