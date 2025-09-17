@@ -928,6 +928,7 @@ app = Flask(__name__)
 # Landing/health on "/"
 @app.route("/", methods=["GET", "HEAD"])
 def root():
+    _dbg("[ROOT] 200")
     return "OK", 200
 
 @app.route("/health")
