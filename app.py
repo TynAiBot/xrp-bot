@@ -1117,17 +1117,26 @@ def webhook():
         # Lock per symbool: beschermt tegen bind()/commit() van idle_worker
         lock = SYMBOL_LOCKS.setdefault(SYMBOL_TV, Lock())
         with lock:
-            # 1) GHOST-RECONCILE: in_position True maar geen holdings → vlak zetten
-            if in_position and (pos_amount <= 1e-12 or entry_price <= 0.0):
-                _dbg(f"[GUARD] ghost detected: in_position=True, pos_amount={pos_amount}, entry_price={entry_price} → reconcile flat")
-                in_position = False
-                pos_amount  = 0.0
-                pos_quote   = 0.0
-                entry_price = 0.0
+            # 1) Ghost-snapshot guard: positie lijkt aan, maar gegevens zijn onbruikbaar -> rehydrate + skip
+            if in_position and (pos_amount <= REHYDRATE_MIN_XRP or entry_price <= 0):
+                _dbg(f"[GUARD] in_position snapshot invalid (amt={pos_amount}, entry={entry_price}) → rehydrate + skip")
+                try:
+                    _rehydrate_all_symbols()
+                except Exception as e:
+                    _dbg(f"[REHYDRATE] failed: {e}")
                 commit(SYMBOL_TV)
+                return "OK", 200
 
+            # Al in positie? Niet nog een keer kopen.
             if in_position:
                 _dbg(f"buy ignored: already in_position at entry={entry_price}")
+                commit(SYMBOL_TV)
+                return "OK", 200
+
+            # 2) Anti double-entry: korte cooldown na laatste actie
+            now_ts = time.time()
+            if now_ts - last_action_ts < MIN_TRADE_COOLDOWN_S:
+                _dbg(f"buy ignored: cooldown {MIN_TRADE_COOLDOWN_S}s not elapsed")
                 commit(SYMBOL_TV)
                 return "OK", 200
 
@@ -1140,45 +1149,8 @@ def webhook():
 
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
+                    order = _place_mexc_market(SYMBOL_TV, "buy", TRADE_BUDGET, price)
                     ex = _mexc_live()
-
-                    # --- prijs bepalen ---
-                    px = float(tv_price or price or 0.0)
-                    if px <= 0.0:
-                        try:
-                            px, _ = fetch_last_price_any(SYMBOL_TV)  # als je helper bestaat
-                        except Exception:
-                            _dbg("[BUY] no price available")
-                            commit(SYMBOL_TV)
-                            return "OK", 200
-
-                    # --- budget en kandidaat-amount ---
-                    quote_budget = float(TRADE_BUDGET)
-                    try:
-                        amt_cand = float(ex.amount_to_precision(SYMBOL_TV, quote_budget / max(px, 1e-12)))
-                    except Exception:
-                        amt_cand = quote_budget / max(px, 1e-12)
-
-                    # min amount ophalen
-                    try:
-                        m = ex.market(SYMBOL_TV)
-                        min_amt = float((((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0) or 0.0)
-                    except Exception:
-                        min_amt = 0.0
-
-                    # 2) NOOIT 0-AMOUNT: als afronding/budget te klein → minimaal verhandelbare size
-                    if amt_cand <= 0.0 or (min_amt > 0.0 and amt_cand < min_amt):
-                        if min_amt > 0.0:
-                            quote_budget = max(quote_budget, min_amt * px)
-                        else:
-                            _dbg(f"[LIVE] BUY skipped: amt<=0 (budget={quote_budget}, price={px}, min_amt={min_amt})")
-                            commit(SYMBOL_TV)
-                            return "OK", 200
-
-                    # Plaats market order via snelle helper (met FAST_FILL support)
-                    order = _place_mexc_market(SYMBOL_TV, "buy", quote_budget, px)
-
-                    # Breakdown (werkt ook bij FAST_FILL door ingevulde velden)
                     avg2, filled2, gross_q, fee_q, net_in = _order_quote_breakdown(ex, SYMBOL_TV, order, "buy")
 
                     price = float(avg2)
@@ -1196,8 +1168,8 @@ def webhook():
 
             entry_price = price if pos_amount > 0 else 0.0
             in_position = True
-            last_action_ts = time.time()
-            entry_ts = time.time()
+            last_action_ts = now_ts
+            entry_ts = now_ts
             tpsl_on_buy(entry_price)
 
             # Telegram
