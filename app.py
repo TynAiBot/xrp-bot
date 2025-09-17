@@ -13,7 +13,7 @@ Clean, robust app.py for 2 pairs on MEXC with Telegram alerts.
 import os
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Dict, Any, Optional, Tuple
 
@@ -52,7 +52,7 @@ def _dbg(msg: str):
     print(f"[SIGDBG] {msg}", flush=True)
 
 def now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def tv_to_ccxt(symbol_tv: str) -> str:
     # "XRPUSDT" -> "XRP/USDT"
@@ -88,6 +88,7 @@ DEDUP_WINDOW_S = env_int("DEDUP_WINDOW_S", 20)
 # ------------- telegram -------------
 def send_tg(text_html: str) -> bool:
     if not TG_TOKEN or not TG_CHAT_ID:
+        _dbg("[TG] missing TG_TOKEN or TG_CHAT_ID")
         return False
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     data = {"chat_id": TG_CHAT_ID, "text": text_html, "parse_mode": "HTML"}
@@ -95,12 +96,14 @@ def send_tg(text_html: str) -> bool:
         try:
             r = requests.post(url, data=data, timeout=10)
             if r.status_code == 200:
+                _dbg("[TG] OK sent")
                 return True
             if r.status_code == 429:
                 retry_after = int(r.headers.get("Retry-After", "2"))
+                _dbg(f"[TG] 429 rate-limited; retry_after={retry_after}s")
                 time.sleep(min(retry_after, 5))
                 continue
-            _dbg(f"[TG] {r.status_code} {r.text[:200]}")
+            _dbg(f"[TG] FAIL {r.status_code}: {r.text[:200]}")
         except requests.exceptions.Timeout:
             _dbg("[TG] timeout, retrying...")
             time.sleep(1 + attempt)
@@ -318,6 +321,12 @@ def config():
         "state": st,
     }), 200
 
+
+@app.route("/test/send", methods=["GET"])
+def test_send():
+    ok = send_tg(f"✅ TG test — {now_iso()}")
+    return jsonify({"ok": bool(ok)}), 200
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     ct = request.headers.get("Content-Type", "")
@@ -344,7 +353,7 @@ def webhook():
     try:
         tv_now = str(payload.get("timenow") or "")
         if tv_now.endswith("Z"):
-            from datetime import datetime
+            from datetime import datetime, timezone
             tv_dt = datetime.strptime(tv_now, "%Y-%m-%dT%H:%M:%SZ")
             srv_dt = datetime.utcnow()
             lag_ms = (srv_dt - tv_dt).total_seconds() * 1000.0
