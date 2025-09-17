@@ -1234,6 +1234,24 @@ def webhook():
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
                     ex = _mexc_live()
+
+                    # --- EXCHANGE RECONCILE: klopt onze positie met de beurs? ---
+                    try:
+                        bal  = ex.fetch_balance()
+                        base = SYMBOL_TV.split('/')[0]
+                        free_base  = float(((bal.get('free')  or {}).get(base)) or 0.0)
+                        total_base = float(((bal.get('total') or {}).get(base)) or 0.0)
+                        if total_base <= 1e-12:
+                            _dbg(f"[RECON] {SYMBOL_TV} exchange total=0 → flatten local state")
+                            in_position = False
+                            pos_amount  = 0.0
+                            pos_quote   = 0.0
+                            entry_price = 0.0
+                            commit(SYMBOL_TV)
+                            return "OK", 200
+                    except Exception as e_bal:
+                        _dbg(f"[RECON] fetch_balance failed: {e_bal}")
+
                     # veilige sell-amount bepalen (met fallback als /account faalt)
                     try:
                         amt, info = _prepare_sell_amount(ex, SYMBOL_TV, pos_amount0)
@@ -1256,6 +1274,30 @@ def webhook():
 
                     if amt <= 0.0:
                         _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount0}, free={info.get('free_amt')}) → dust")
+
+                        # Als de beurs free=0 meldt, check 1x total; zo ja=0 → flatten lokaal
+                        try:
+                            if float(info.get("free_amt") or 0.0) <= 1e-12:
+                                bal  = ex.fetch_balance()
+                                base = SYMBOL_TV.split('/')[0]
+                                total_base = float(((bal.get('total') or {}).get(base)) or 0.0)
+                                if total_base <= 1e-12:
+                                    _dbg(f"[RECON] {SYMBOL_TV} total=0 bij amt<=0 → flatten local state")
+                                    in_position = False
+                                    entry_price = 0.0
+                                    pos_amount  = 0.0
+                                    pos_quote   = 0.0
+                                    send_tg(
+                                        f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n"
+                                        f"🧠 Reden: reconcile_flatten (exchange total=0)\n"
+                                        f"🕒 Tijd: {now_str()}"
+                                    )
+                                    log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
+                                    commit(SYMBOL_TV)
+                                    return "OK", 200
+                        except Exception:
+                            pass
+
                         if pos_amount0 <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
                             in_position = False
                             entry_price = 0.0
@@ -1307,10 +1349,25 @@ def webhook():
 
                 except Exception as e_sell:
                     msg = str(e_sell).lower()
+
+                    # Specifiek: oversold/insufficient → flatten i.p.v. blijven hangen
+                    if "oversold" in msg or "insufficient" in msg:
+                        _dbg("[LIVE] MEXC SELL oversold/insufficient → flatten local state")
+                        in_position = False
+                        pos_amount  = 0.0
+                        pos_quote   = 0.0
+                        entry_price = 0.0
+                        commit(SYMBOL_TV)
+                        return "OK", 200
+
                     # één retry met minimaal toelaatbare amount
                     if "minimum amount" in msg or "precision" in msg or "min" in msg:
-                        min_retry = info.get("min_amt", 0.0)
-                        if info.get("free_amt", 0.0) >= min_retry and min_retry > 0:
+                        min_retry = info.get("min_amt", 0.0) if 'info' in locals() else 0.0
+                        try:
+                            free_amt = float(info.get("free_amt", 0.0)) if 'info' in locals() else 0.0
+                        except Exception:
+                            free_amt = 0.0
+                        if free_amt >= min_retry and min_retry > 0:
                             try:
                                 retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
                                 _dbg(f"[SELL RETRY] using min_amt={retry_amt}")
@@ -1363,9 +1420,9 @@ def webhook():
                 except NameError:
                     filled = pos_amount0
                 if pos_amount0 > 0 and filled < pos_amount0:
-                    factor     = (pos_amount0 - filled) / pos_amount0
-                    pos_quote  = round(pos_quote0 * factor, 6)
-                    pos_amount = round(pos_amount0 - filled, 6)
+                    factor      = (pos_amount0 - filled) / pos_amount0
+                    pos_quote   = round(pos_quote0 * factor, 6)
+                    pos_amount  = round(pos_amount0 - filled, 6)
                     in_position = pos_amount > REHYDRATE_MIN_XRP
                     entry_price = (pos_quote / pos_amount) if in_position and pos_amount > 0 else 0.0
                 else:
