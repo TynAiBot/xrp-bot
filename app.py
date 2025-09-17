@@ -1165,8 +1165,16 @@ def webhook():
 
                     # 0b) Staat er al een open BUY-order? Dan geen nieuwe market-buy.
                     try:
-                        oo = ex.fetch_open_orders(SYMBOL_TV)
-                        if any((o.get("side") or "").lower() == "buy" for o in (oo or [])):
+                        oo = ex.fetch_open_orders(SYMBOL_TV, params={"recvWindow": MEXC_RECV_WINDOW})
+                        # Status/side check defensief (sommige CCXT drivers vullen 'status' niet)
+                        has_open_buy = False
+                        for o in (oo or []):
+                            side = (o.get("side") or o.get("type") or "").lower()
+                            status = (o.get("status") or "open").lower()
+                            if side == "buy" and status in ("open", "new", "partially_filled"):
+                                has_open_buy = True
+                                break
+                        if has_open_buy:
                             _dbg("[PREBUY] open BUY order bestaat al → skip")
                             commit(SYMBOL_TV)
                             return "OK", 200
@@ -1514,7 +1522,9 @@ def webhook():
             )
             log_trade("sell", display_fill, winst_bedrag, source, tf, SYMBOL_TV)
             commit(SYMBOL_TV)
-            return "OK", 200def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
+            return "OK", 200
+
+def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
     global in_position, entry_price, capital, sparen, last_action_ts, pos_amount, pos_quote
     if not in_position and not (LIVE_MODE and LIVE_EXCHANGE == "mexc" and pos_amount > 1e-12):
         return False
