@@ -1,4 +1,3 @@
-import html
 # app.py — Multi-pair bot (XRP/USDT + WLFI/USDT)
 # - TradingView webhooks (buy/sell) met symbool-herkenning (MEXC:WLFIUSDT, WLFI/USDT, etc.)
 # - Live SPOT trading via MEXC (ccxt), fees & partial fills → PnL pro rata
@@ -15,6 +14,23 @@ import os, time, json
 from datetime import datetime, timedelta
 from threading import Thread, Lock
 from typing import Tuple, Dict, Any
+import html
+
+# ---- MEXC recvWindow helper/constant (robust) ----
+try:
+    MEXC_RECV_WINDOW = env_int("MEXC_RECVWINDOW_MS", 10000)  # ms
+except Exception:
+    import os
+    try:
+        MEXC_RECV_WINDOW = int(os.getenv("MEXC_RECVWINDOW_MS", "10000"))
+    except Exception:
+        MEXC_RECV_WINDOW = 10000
+
+def _recvwin() -> int:
+    try:
+        return int(globals().get("MEXC_RECV_WINDOW", 10000))
+    except Exception:
+        return 10000
 
 def ht(x) -> str:
     """Veilige HTML-escape voor Telegram parse_mode=HTML."""
@@ -277,50 +293,40 @@ def commit(sym: str):
 
 
 # ---------------- Telegram -----------------
-def send_tg(text_html: str, *, disable_web_page_preview: bool = True, disable_notification: bool = False) -> bool:
+def send_tg(text_html: str):
     if not TG_TOKEN or not TG_CHAT_ID:
         return False
-
-    # Fallback & veilig inkorten (Telegram limiet ~4096 chars)
-    if not text_html:
-        text_html = "—"
-    if len(text_html) > 4000:
-        text_html = text_html[:3980] + "\n…(truncated)"
-
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TG_CHAT_ID,
-        "text": text_html,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": disable_web_page_preview,
-        "disable_notification": disable_notification,
-    }
-
-    for attempt in range(5):
+    data = {"chat_id": TG_CHAT_ID, "text": text_html, "parse_mode": "HTML"}
+    for attempt in range(3):
         try:
             r = requests.post(url, data=data, timeout=10)
             if r.status_code == 200:
                 return True
             if r.status_code == 429:
-                # Respecteer Telegram rate limit
+                retry_after = 2
                 try:
-                    retry_after = int(r.headers.get("Retry-After", "2"))
+                    retry_after = int(r.headers.get("Retry-After") or 2)
                 except Exception:
-                    retry_after = 2
-                time.sleep(min(max(retry_after, 1), 10))
+                    pass
+                try:
+                    retry_after = int((r.json().get("parameters") or {}).get("retry_after", retry_after))
+                except Exception:
+                    pass
+                time.sleep(min(retry_after, 5))
                 continue
-            if 500 <= r.status_code < 600:
-                # Tijdelijke serverfout: korte backoff en nogmaals
-                time.sleep(1.5)
-                continue
-
-            print(f"[TG] {r.status_code} {r.text}")
-            return False
+            print(f"[TG] {r.status_code} {r.text[:200]}", flush=True)
+            break
+        except requests.exceptions.Timeout:
+            print("[TG] timeout, retrying...", flush=True)
+            time.sleep(1 + attempt)
         except Exception as e:
-            print(f"[TG] error: {e}")
-            time.sleep(1.0)
-
+            print(f"[TG ERROR] {e}", flush=True)
+            break
     return False
+
+
+# ---------------- Advisor -----------------
 def _advisor_load():
     global ADVISOR_STATE
     try:
@@ -582,7 +588,7 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
         try:
             cur = str(ff.get("currency", "")).upper()
             val = float(ff.get("cost") or 0.0)
-            if val <= 0: 
+            if val <= 0:
                 continue
             if cur in {"USDT", "USD"}:
                 fee_q += val
@@ -596,7 +602,7 @@ def _order_quote_breakdown(ex, symbol, order: dict, side: str):
             try:
                 cur = str(f.get("currency", "")).upper()
                 val = float(f.get("cost") or 0.0)
-                if val <= 0: 
+                if val <= 0:
                     continue
                 if cur in {"USDT", "USD"}:
                     fee_q += val
@@ -673,70 +679,53 @@ def _prepare_sell_amount(ex, symbol: str, desired_amt: float):
 
 def _place_mexc_market(symbol: str, side: str, budget_quote: float, price_hint: float = 0.0):
     ex = _mexc_live()
-    # Voor BUY gebruiken we quoteOrderQty (besteedde USDT). Voor SELL gebruiken we quantity (base).
     side_l = (side or "").lower()
     if side_l not in ("buy", "sell"):
-        raise ValueError("side must be 'buy' or 'sell'")
+        raise ValueError("side must be 'buy' of 'sell'")
 
-    # Market info / limits
     m = ex.market(symbol)
     min_amt  = float((((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0) or 0.0)
     min_cost = float((((m.get("limits") or {}).get("cost")   or {}).get("min") or 0.0) or 0.0)
     quote_ccy = (m.get("quote") or symbol.split("/")[1]).upper()
 
-    params = {"recvWindow": MEXC_RECV_WINDOW}
+    params = {"recvWindow": _recvwin()}
 
     if side_l == "buy":
         spend = float(budget_quote or 0.0)
         if spend <= 0:
-            raise ValueError("budget_quote must be > 0 for market BUY")
+            raise ValueError("budget_quote moet > 0 zijn voor market BUY")
 
-        # Respecteer beschikbare USDT
         try:
             bal = ex.fetch_balance(params=params)
             free_q = float(((bal.get("free") or {}).get(quote_ccy)) or 0.0)
         except Exception:
-            free_q = spend  # als balans faalt, ga uit van spend
+            free_q = spend
 
-        # Clamp spend aan free_q
         spend = min(spend, free_q)
         if min_cost and spend < min_cost:
-            # te weinig balans om min cost te halen → raise zodat caller kan loggen/skippen
             raise ValueError(f"insufficient quote balance: have {free_q}, need >= min_cost {min_cost}")
 
-        # MEXC verwacht quoteOrderQty in quote asset (USDT)
-        if hasattr(ex, "price_to_precision"):
-            try:
-                spend_prec = float(ex.price_to_precision(symbol, spend))
-            except Exception:
-                spend_prec = float(round(spend, 6))
-        else:
+        try:
+            spend_prec = float(ex.price_to_precision(symbol, spend))
+        except Exception:
             spend_prec = float(round(spend, 6))
         params["quoteOrderQty"] = spend_prec
         order = ex.create_order(symbol, "market", "buy", None, None, params)
 
     else:
-        # SELL: hoeveelheid in base
         if price_hint and budget_quote and budget_quote > 0:
             qty = float(budget_quote / max(price_hint, 1e-12))
         else:
             qty = 0.0
         if qty and qty < min_amt:
             qty = min_amt
-        if qty:
-            if hasattr(ex, "amount_to_precision"):
-                try:
-                    amount = float(ex.amount_to_precision(symbol, qty))
-                except Exception:
-                    amount = float(round(qty, 6))
-            else:
-                amount = float(round(qty, 6))
-        else:
-            amount = None
+        try:
+            amount = float(ex.amount_to_precision(symbol, qty)) if qty else None
+        except Exception:
+            amount = float(round(qty, 6)) if qty else None
         order = ex.create_order(symbol, "market", "sell", amount, None, params)
 
     return order
-
 def _tpsl_defaults_from_env():
     return {
         "tp_pct": LOCAL_TP_PCT,
@@ -1164,7 +1153,7 @@ def webhook():
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
                     ex = _mexc_live()
-                    bal = ex.fetch_balance(params={"recvWindow": MEXC_RECV_WINDOW})
+                    bal = ex.fetch_balance(params={"recvWindow": _recvwin()})
                     base = SYMBOL_TV.split("/")[0]
                     free = float(((bal.get("free") or {}).get(base)) or 0.0)
                     used = float(((bal.get("used") or {}).get(base)) or 0.0)
@@ -1180,7 +1169,7 @@ def webhook():
                         # Markeer lokale state en skip de buy
                         if not in_position or pos_amount < total * 0.999:
                             _dbg(f"[PREBUY] exchange base_total={total} > min → mark in_position & skip")
-                        in_position = True
+                        in_position = bool(pos_amount and pos_amount > REHYDRATE_MIN_XRP)
                         pos_amount  = round(total, 6)
                         # Bij benadering pos_quote herstellen als die 0 is en entry bekend
                         if entry_price > 0 and pos_quote <= 0:
@@ -1190,13 +1179,12 @@ def webhook():
 
                     # 0b) Staat er al een open BUY-order? Dan geen nieuwe market-buy.
                     try:
-                        oo = ex.fetch_open_orders(SYMBOL_TV, params={"recvWindow": MEXC_RECV_WINDOW})
-                        # Status/side check defensief (sommige CCXT drivers vullen 'status' niet)
+                        oo = ex.fetch_open_orders(SYMBOL_TV, params={"recvWindow": _recvwin()})
                         has_open_buy = False
                         for o in (oo or []):
                             side = (o.get("side") or o.get("type") or "").lower()
                             status = (o.get("status") or "open").lower()
-                            if side == "buy" and status in ("open", "new", "partially_filled"):
+                            if side == "buy" and status in ("open","new","partially_filled"):
                                 has_open_buy = True
                                 break
                         if has_open_buy:
@@ -1252,16 +1240,12 @@ def webhook():
                     pos_quote  = float(net_in if (net_in or 0.0) > 0 else round(price * pos_amount, 6))
 
                     _dbg(f"[LIVE] MEXC BUY {SYMBOL_TV} id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
+
                     if pos_amount <= 0 or pos_quote <= 0:
                         _dbg("[LIVE] BUY zero-fill detected → skip marking position")
                         commit(SYMBOL_TV)
                         return "OK", 200
-                except Exception as e:
-                    msg = str(e).lower()
-                    if "insufficient" in msg or "min cost" in msg or "min_cost" in msg:
-                        _dbg(f"[LIVE] BUY skipped: {e}")
-                        commit(SYMBOL_TV)
-                        return "OK", 200
+except Exception as e:
                     _dbg(f"[LIVE] MEXC BUY failed: {e}")
                     commit(SYMBOL_TV)
                     return "LIVE BUY failed", 500
@@ -1375,8 +1359,8 @@ def webhook():
                                     pos_amount  = 0.0
                                     pos_quote   = 0.0
                                     send_tg(
-                                        f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\\n"
-                                        f"🧠 Reden: reconcile_flatten (exchange total=0)\\n"
+                                        f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n"
+                                        f"🧠 Reden: reconcile_flatten (exchange total=0)\n"
                                         f"🕒 Tijd: {now_str()}"
                                     )
                                     log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
@@ -1391,9 +1375,9 @@ def webhook():
                             pos_amount  = 0.0
                             pos_quote   = 0.0
                             send_tg(
-                                f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\\n"
-                                f"🧠 Reden: dust_below_exchange_min\\n"
-                                f"🪙 Restpositie intern gesloten (dust)\\n"
+                                f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n"
+                                f"🧠 Reden: dust_below_exchange_min\n"
+                                f"🪙 Restpositie intern gesloten (dust)\n"
                                 f"🕒 Tijd: {now_str()}"
                             )
                             log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
@@ -1470,6 +1454,11 @@ def webhook():
 
                 # ---- order opvullen en PnL berekenen ----
                 avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
+                if float(filled2 or 0.0) <= 0.0:
+                    _dbg("[LIVE] SELL zero-fill detected → no state change, no TG")
+                    commit(SYMBOL_TV)
+                    return "OK", 200
+
                 display_fill = float(avg2 or tv_sell or 0.0)
                 filled       = float(filled2 or 0.0)
 
@@ -1532,7 +1521,7 @@ def webhook():
             base_for_delta = tv_sell if tv_sell else display_fill
             delta_txt = f"  (Δ {(display_fill / base_for_delta - 1) * 100:+.2f}%)" if base_for_delta else ""
             resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
-            rest_txt  = f"\\n🪙 Resterend: {pos_amount:.4f} @ ~${entry_price:.6f}" if in_position else ""
+            rest_txt  = f"\n🪙 Resterend: {pos_amount:.4f} @ ~${entry_price:.6f}" if in_position else ""
 
             # Safe vars voor bericht
             tv_show  = float(tv_price or display_fill or 0.0)
@@ -1558,6 +1547,7 @@ def webhook():
             commit(SYMBOL_TV)
             return "OK", 200
 
+# --------------- Forced exits ---------------
 def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
     global in_position, entry_price, capital, sparen, last_action_ts, pos_amount, pos_quote
     if not in_position and not (LIVE_MODE and LIVE_EXCHANGE == "mexc" and pos_amount > 1e-12):
