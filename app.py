@@ -1149,42 +1149,42 @@ def webhook():
         # Lock per symbool: beschermt tegen bind()/commit() van idle_worker
         lock = SYMBOL_LOCKS.setdefault(SYMBOL_TV, Lock())
         with lock:
-            # 0) REALITY-CHECK tegen dubbele buys: heb je al base op de exchange?
+            # 0) PREBUY reality check (balans + open BUY orders)
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
                     ex = _mexc_live()
                     bal = ex.fetch_balance(params={"recvWindow": _recvwin()})
-                    base = SYMBOL_TV.split("/")[0]
+                    base = sym_pair.split("/")[0]
                     free = float(((bal.get("free") or {}).get(base)) or 0.0)
                     used = float(((bal.get("used") or {}).get(base)) or 0.0)
                     total = float(((bal.get("total") or {}).get(base)) or (free + used))
-                    # minimale amount (ignoreer echte dust)
+
                     try:
-                        m = ex.market(SYMBOL_TV)
+                        m = ex.market(sym_pair)
                         min_amt = float((((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0) or 0.0)
                     except Exception:
                         min_amt = 0.0
 
                     if total > max(min_amt, REHYDRATE_MIN_XRP):
-                        # Markeer lokale state en skip de buy
                         if not in_position or pos_amount < total * 0.999:
                             _dbg(f"[PREBUY] exchange base_total={total} > min → mark in_position & skip")
-                        in_position = bool(pos_amount and pos_amount > REHYDRATE_MIN_XRP)
+                        in_position = True
                         pos_amount  = round(total, 6)
-                        # Bij benadering pos_quote herstellen als die 0 is en entry bekend
                         if entry_price > 0 and pos_quote <= 0:
                             pos_quote = round(entry_price * pos_amount, 6)
+                        # schrijf terug en afsluiten
+                        pos.update({"in_position": in_position, "pos_amount": pos_amount, "pos_quote": pos_quote})
                         commit(SYMBOL_TV)
                         return "OK", 200
 
-                    # 0b) Staat er al een open BUY-order? Dan geen nieuwe market-buy.
+                    # 0b) Open BUY-order aanwezig? → skip
                     try:
-                        oo = ex.fetch_open_orders(SYMBOL_TV, params={"recvWindow": _recvwin()})
+                        oo = ex.fetch_open_orders(sym_pair, params={"recvWindow": _recvwin()})
                         has_open_buy = False
                         for o in (oo or []):
                             side = (o.get("side") or o.get("type") or "").lower()
                             status = (o.get("status") or "open").lower()
-                            if side == "buy" and status in ("open","new","partially_filled"):
+                            if side == "buy" and status in ("open", "new", "partially_filled"):
                                 has_open_buy = True
                                 break
                         if has_open_buy:
@@ -1195,25 +1195,21 @@ def webhook():
                         pass
 
                 except Exception as e:
-                    _dbg(f"[PREBUY] balance check failed: {e}")
+                    _dbg(f"[PREBUY] balance/open_orders check failed: {e}")
 
-            # 1) Ghost-snapshot guard: positie lijkt aan, maar gegevens zijn onbruikbaar -> rehydrate + skip
+            # 1) Ghost-snapshot guard
             if in_position and (pos_amount <= REHYDRATE_MIN_XRP or entry_price <= 0):
-                _dbg(f"[GUARD] in_position snapshot invalid (amt={pos_amount}, entry={entry_price}) → rehydrate + skip")
-                try:
-                    _rehydrate_all_symbols()
-                except Exception as e:
-                    _dbg(f"[REHYDRATE] failed: {e}")
+                _dbg(f"[GUARD] ghost detected: in_position={in_position}, pos_amount={pos_amount}, entry_price={entry_price}")
                 commit(SYMBOL_TV)
                 return "OK", 200
 
-            # Al in positie? Niet nog een keer kopen.
+            # Al in positie? → geen dubbele buy
             if in_position:
                 _dbg(f"buy ignored: already in_position at entry={entry_price}")
                 commit(SYMBOL_TV)
                 return "OK", 200
 
-            # 2) Anti double-entry: korte cooldown na laatste actie
+            # 2) Cooldown
             now_ts = time.time()
             if now_ts - last_action_ts < MIN_TRADE_COOLDOWN_S:
                 _dbg(f"buy ignored: cooldown {MIN_TRADE_COOLDOWN_S}s not elapsed")
@@ -1221,46 +1217,65 @@ def webhook():
                 return "OK", 200
 
             # 3) Trend filter
-            ok, ma = trend_ok(price, SYMBOL_TV)
+            ok, ma = trend_ok(price, sym_pair)
             _dbg(f"trend_ok={ok} ma={ma:.6f} price={price:.6f}")
             if not ok:
                 _dbg("blocked by trend filter")
                 commit(SYMBOL_TV)
                 return "OK", 200
 
-            # 4) Order plaatsen
+            # 4) Order plaatsen (MEXC: BUY via quoteOrderQty)
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
-                    order = _place_mexc_market(SYMBOL_TV, "buy", TRADE_BUDGET, price)
+                    order = _place_mexc_market(sym_pair, "buy", get_budget(SYMBOL_TV), price)
                     ex = _mexc_live()
-                    avg2, filled2, gross_q, fee_q, net_in = _order_quote_breakdown(ex, SYMBOL_TV, order, "buy")
+                    avg2, filled2, gross_q, fee_q, net_in = _order_quote_breakdown(ex, sym_pair, order, "buy")
 
                     price      = float(avg2 or price or 0.0)
                     pos_amount = float(filled2 or 0.0)
-                    pos_quote  = float(net_in if (net_in or 0.0) > 0 else round(price * pos_amount, 6))
+                    pos_quote  = float(net_in or 0.0)
+                    if pos_quote <= 0 and pos_amount > 0:
+                        pos_quote = round(price * pos_amount, 6)
 
-                    _dbg(f"[LIVE] MEXC BUY {SYMBOL_TV} id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
+                    _dbg(f"[LIVE] MEXC BUY {sym_pair} id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
 
+                    # 0-fill/ghost guard
                     if pos_amount <= 0 or pos_quote <= 0:
                         _dbg("[LIVE] BUY zero-fill detected → skip marking position")
                         commit(SYMBOL_TV)
                         return "OK", 200
-except Exception as e:
+
+                except Exception as e:
+                    msg = str(e).lower()
+                    # Netjes skippen i.p.v. 500 bij te weinig USDT / min notional
+                    if "insufficient" in msg or "min cost" in msg or "min_cost" in msg:
+                        _dbg(f"[LIVE] BUY skipped: {e}")
+                        commit(SYMBOL_TV)
+                        return "OK", 200
                     _dbg(f"[LIVE] MEXC BUY failed: {e}")
                     commit(SYMBOL_TV)
                     return "LIVE BUY failed", 500
             else:
-                pos_amount = float(TRADE_BUDGET) / float(price or 1e-12)
-                pos_quote  = float(TRADE_BUDGET)
+                pos_amount = float(get_budget(SYMBOL_TV)) / float(price or 1e-12)
+                pos_quote  = float(get_budget(SYMBOL_TV))
 
             # 5) State bijwerken
             entry_price    = float(price if pos_amount > 0 else 0.0)
-            in_position    = True
+            in_position    = bool(pos_amount and pos_amount > REHYDRATE_MIN_XRP)
             last_action_ts = now_ts
             entry_ts       = now_ts
+
+            pos.update({
+                "in_position": in_position,
+                "pos_amount": round(pos_amount, 6),
+                "pos_quote": round(pos_quote, 6),
+                "entry_price": entry_price,
+                "entry_ts": entry_ts,
+                "last_action_ts": last_action_ts,
+            })
             tpsl_on_buy(entry_price)
 
-            # 6) Telegram + logging (safe vars + delta guards)
+            # 6) Telegram + logging (safe)
             tv_show  = float(tv_price or price or 0.0)
             base_for_delta = tv_show if tv_show else price
             delta_txt = f"  (Δ {(price / base_for_delta - 1) * 100:+.2f}%)" if (base_for_delta and price) else ""
@@ -1270,7 +1285,7 @@ except Exception as e:
             ts        = timestamp or now_str()
 
             send_tg(
-                f"""🟢 <b>[{SYMBOL_TV}] AANKOOP</b>
+                f"""🟢 <b>[{sym_pair}] AANKOOP</b>
 📹 TV prijs: ${tv_show:.6f}
 🎯 Fill (MEXC): ${float(price or 0.0):.6f}{delta_txt}
 🧠 Signaalbron: {source_h} | {advisor_h}
@@ -1278,12 +1293,13 @@ except Exception as e:
 💰 Handelssaldo: €{capital:.2f}
 💼 Spaarrekening: €{sparen:.2f}
 📈 Totale waarde: €{capital + sparen:.2f}
-🔐 Tradebedrag: €{TRADE_BUDGET:.2f}
+🔐 Tradebedrag: €{get_budget(SYMBOL_TV):.2f}
 🔗 Tijd: {ts}"""
             )
-            log_trade("buy", float(price or 0.0), 0.0, source, tf, SYMBOL_TV)
+            log_trade("buy", float(price or 0.0), 0.0, source, tf, sym_pair)
             commit(SYMBOL_TV)
             return "OK", 200
+
 
     # === SELL ===
     if action == "sell":
