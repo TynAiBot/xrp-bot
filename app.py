@@ -671,47 +671,72 @@ def _prepare_sell_amount(ex, symbol: str, desired_amt: float):
         return 0.0, info
     return amt, info
 
-def _place_mexc_market(symbol: str, side: str, quote_amount_usd: float, ref_price: float):
+def _place_mexc_market(symbol: str, side: str, budget_quote: float, price_hint: float = 0.0):
     ex = _mexc_live()
-    amount = _qty_for_quote(ex, symbol, quote_amount_usd, ref_price)
-    if amount <= 0:
-        raise RuntimeError("Calculated amount <= 0")
+    # Voor BUY gebruiken we quoteOrderQty (besteedde USDT). Voor SELL gebruiken we quantity (base).
+    side_l = (side or "").lower()
+    if side_l not in ("buy", "sell"):
+        raise ValueError("side must be 'buy' or 'sell'")
 
-    order = ex.create_order(symbol, "market", side, amount)
+    # Market info / limits
+    m = ex.market(symbol)
+    min_amt  = float((((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0) or 0.0)
+    min_cost = float((((m.get("limits") or {}).get("cost")   or {}).get("min") or 0.0) or 0.0)
+    quote_ccy = (m.get("quote") or symbol.split("/")[1]).upper()
 
-    if FAST_FILL:
-        # Snel pad: geen fetch loops; vul basisvelden zodat _order_quote_breakdown kan rekenen
-        order.setdefault("amount", amount)
-        order.setdefault("filled", amount)     # market -> meestal full fill
-        order.setdefault("price", ref_price)
-        order.setdefault("average", ref_price)
-        order.setdefault("cost", amount * ref_price)
-        return order
+    params = {"recvWindow": MEXC_RECV_WINDOW}
 
-    oid = order.get("id")
-    if oid:
-        for _ in range(3):
+    if side_l == "buy":
+        spend = float(budget_quote or 0.0)
+        if spend <= 0:
+            raise ValueError("budget_quote must be > 0 for market BUY")
+
+        # Respecteer beschikbare USDT
+        try:
+            bal = ex.fetch_balance(params=params)
+            free_q = float(((bal.get("free") or {}).get(quote_ccy)) or 0.0)
+        except Exception:
+            free_q = spend  # als balans faalt, ga uit van spend
+
+        # Clamp spend aan free_q
+        spend = min(spend, free_q)
+        if min_cost and spend < min_cost:
+            # te weinig balans om min cost te halen → raise zodat caller kan loggen/skippen
+            raise ValueError(f"insufficient quote balance: have {free_q}, need >= min_cost {min_cost}")
+
+        # MEXC verwacht quoteOrderQty in quote asset (USDT)
+        if hasattr(ex, "price_to_precision"):
             try:
-                time.sleep(0.25)
-                o2 = ex.fetch_order(oid, symbol)
-                if o2:
-                    order = {**order, **o2}
-                if not order.get("trades"):
-                    try:
-                        trs = ex.fetch_order_trades(oid, symbol)
-                        if trs:
-                            order["trades"] = trs
-                    except Exception:
-                        pass
-                if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
-                    break
+                spend_prec = float(ex.price_to_precision(symbol, spend))
             except Exception:
-                pass
+                spend_prec = float(round(spend, 6))
+        else:
+            spend_prec = float(round(spend, 6))
+        params["quoteOrderQty"] = spend_prec
+        order = ex.create_order(symbol, "market", "buy", None, None, params)
+
+    else:
+        # SELL: hoeveelheid in base
+        if price_hint and budget_quote and budget_quote > 0:
+            qty = float(budget_quote / max(price_hint, 1e-12))
+        else:
+            qty = 0.0
+        if qty and qty < min_amt:
+            qty = min_amt
+        if qty:
+            if hasattr(ex, "amount_to_precision"):
+                try:
+                    amount = float(ex.amount_to_precision(symbol, qty))
+                except Exception:
+                    amount = float(round(qty, 6))
+            else:
+                amount = float(round(qty, 6))
+        else:
+            amount = None
+        order = ex.create_order(symbol, "market", "sell", amount, None, params)
+
     return order
 
-
-
-# --------------- TPSL helpers ---------------
 def _tpsl_defaults_from_env():
     return {
         "tp_pct": LOCAL_TP_PCT,
@@ -1227,7 +1252,16 @@ def webhook():
                     pos_quote  = float(net_in if (net_in or 0.0) > 0 else round(price * pos_amount, 6))
 
                     _dbg(f"[LIVE] MEXC BUY {SYMBOL_TV} id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
+                    if pos_amount <= 0 or pos_quote <= 0:
+                        _dbg("[LIVE] BUY zero-fill detected → skip marking position")
+                        commit(SYMBOL_TV)
+                        return "OK", 200
                 except Exception as e:
+                    msg = str(e).lower()
+                    if "insufficient" in msg or "min cost" in msg or "min_cost" in msg:
+                        _dbg(f"[LIVE] BUY skipped: {e}")
+                        commit(SYMBOL_TV)
+                        return "OK", 200
                     _dbg(f"[LIVE] MEXC BUY failed: {e}")
                     commit(SYMBOL_TV)
                     return "LIVE BUY failed", 500
