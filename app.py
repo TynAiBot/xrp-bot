@@ -1,13 +1,14 @@
 
 # -*- coding: utf-8 -*-
 """
-Clean, robust app.py for 2 pairs on MEXC with Telegram alerts.
-- Pairs: XRP/USDT and WLFI/USDT (extendable)
-- Max spend per pair: 500 USDT (configurable via env)
-- TV webhook JSON: {action: buy/sell, price, source, tf, symbol: 'XRPUSDT'|'WLFIUSDT'}
-- Ensures fills on MEXC by polling fetch_order
-- Dedup per pair + optional cooldown (defaults 0)
-- Simple rehydrate from balances (sell will use free base even after reboot)
+MEXC 2-pair webhook bot with Telegram alerts (robust core).
+- Pairs: XRP/USDT, WLFI/USDT
+- Budget per pair (default 500 USDT), via ENV
+- Dedup, per-symbol locks, in-flight guard
+- Zero-fill fix: poll fetch_order until fill/timeout
+- Rehydrate from balances at startup (sell uses free base)
+- Latency log TV->server
+- Endpoints: /, /health, /config, /envcheck, /test/send, /webhook
 """
 
 import os
@@ -22,6 +23,16 @@ from flask import Flask, request, jsonify
 import ccxt
 
 # ------------- helpers -------------
+def env_first(names, default=""):
+    """
+    Return the first non-empty env value among 'names'.
+    """
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return str(v)
+    return str(default)
+
 def env_str(name: str, default: str = "") -> str:
     v = os.getenv(name, default)
     return str(v) if v is not None else str(default)
@@ -40,13 +51,6 @@ def env_int(name: str, default: int = 0) -> int:
             return int(float(os.getenv(name, default)))
         except Exception:
             return int(default)
-
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return bool(default)
-    s = str(v).strip().lower()
-    return s in ("1", "true", "t", "yes", "y", "on")
 
 def _dbg(msg: str):
     print(f"[SIGDBG] {msg}", flush=True)
@@ -77,8 +81,9 @@ BUDGET_USDT: Dict[str, float] = {
     "WLFI/USDT": env_float("BUDGET_WLFI", 500.0),
 }
 
-TG_TOKEN = env_str("TG_TOKEN")
-TG_CHAT_ID = env_str("TG_CHAT_ID")
+# Accept multiple env names for Telegram for compatibility
+TG_TOKEN  = env_first(["TG_TOKEN","TELEGRAM_BOT_TOKEN","BOT_TOKEN","TELEGRAM_TOKEN"])
+TG_CHAT_ID = env_first(["TG_CHAT_ID","TELEGRAM_CHAT_ID","CHAT_ID"])
 
 MEXC_RECVWINDOW_MS = env_int("MEXC_RECVWINDOW_MS", 10000)
 CCXT_TIMEOUT_MS = env_int("CCXT_TIMEOUT_MS", 10000)
@@ -118,8 +123,8 @@ def mexc() -> ccxt.mexc:
     global _EX
     if _EX:
         return _EX
-    ak = env_str("MEXC_API_KEY") or env_str("MEXC_KEY")
-    sk = env_str("MEXC_API_SECRET") or env_str("MEXC_SECRET")
+    ak = env_first(["MEXC_API_KEY","MEXC_KEY"])
+    sk = env_first(["MEXC_API_SECRET","MEXC_SECRET"])
     if not ak or not sk:
         raise RuntimeError("MEXC_API_KEY / MEXC_API_SECRET ontbreken")
     _EX = ccxt.mexc({
@@ -158,17 +163,6 @@ STATE: Dict[str, Dict[str, Any]] = {
     } for s in SYMBOLS
 }
 
-def _precision_info(ex: ccxt.Exchange, symbol: str) -> Dict[str, Any]:
-    try:
-        m = ex.market(symbol)
-    except Exception:
-        return {"amount_min": 0.0, "amount_step": 0.0, "price_step": 0.0}
-    lims = (m.get("limits") or {})
-    amount_min = float(((lims.get("amount") or {}).get("min") or 0.0) or 0.0)
-    amount_step = float((m.get("precision") or {}).get("amount") or 0)
-    price_step = float((m.get("precision") or {}).get("price") or 0)
-    return {"amount_min": amount_min, "amount_step": amount_step, "price_step": price_step}
-
 def _round_amount(ex: ccxt.Exchange, symbol: str, qty: float) -> float:
     try:
         return float(ex.amount_to_precision(symbol, qty))
@@ -190,7 +184,7 @@ def _order_breakdown(ex: ccxt.Exchange, symbol: str, order: Dict[str, Any], side
         except Exception:
             pass
     gross_q = cost if cost > 0 else (avg * filled if (avg and filled) else 0.0)
-    net_q = max(gross_q - fee_q, 0.0) if side == "buy" else max(gross_q - fee_q, 0.0)
+    net_q = max(gross_q - fee_q, 0.0)
     return avg, filled, gross_q, fee_q, net_q
 
 def _poll_fill(ex: ccxt.Exchange, symbol: str, order_id: str, timeout_s: float = 6.0) -> Dict[str, Any]:
@@ -210,9 +204,7 @@ def _poll_fill(ex: ccxt.Exchange, symbol: str, order_id: str, timeout_s: float =
 def _ensure_spend_buy(ex: ccxt.Exchange, symbol: str, spend_usdt: float, price_hint: float = 0.0) -> Dict[str, Any]:
     """Try market buy by cost; fallback to qty."""
     params = {"recvWindow": MEXC_RECVWINDOW_MS}
-    # attempt cost/quoteOrderQty path
     try:
-        # precision of cost
         spend_prec = float(ex.price_to_precision(symbol, spend_usdt))
     except Exception:
         spend_prec = round(spend_usdt, 6)
@@ -221,7 +213,6 @@ def _ensure_spend_buy(ex: ccxt.Exchange, symbol: str, spend_usdt: float, price_h
     try:
         o = ex.create_order(symbol, "market", "buy", None, None, params)
     except Exception as e:
-        # fallback: compute qty by price
         _dbg(f"[LIVE] cost-buy not supported, fallback qty: {e}")
         p = float(price_hint or 0.0)
         if p <= 0:
@@ -235,7 +226,6 @@ def _ensure_spend_buy(ex: ccxt.Exchange, symbol: str, spend_usdt: float, price_h
         qty = spend_usdt / max(p, 1e-12)
         qty = _round_amount(ex, symbol, qty)
         o = ex.create_order(symbol, "market", "buy", qty, None, {"recvWindow": MEXC_RECVWINDOW_MS})
-    # ensure fill
     o2 = _poll_fill(ex, symbol, o.get("id"))
     return o2 or o
 
@@ -262,7 +252,6 @@ def blocked_by_cooldown(symbol: str, action: str) -> bool:
     if COOLDOWN_S <= 0:
         return False
     st = STATE[symbol]
-    # Allow SELL during cooldown if in position
     if action == "sell" and st.get("in_position"):
         return False
     last_ts = float(st.get("last_action_ts") or 0.0)
@@ -282,7 +271,6 @@ def rehydrate_positions() -> None:
         if free > 0:
             STATE[sym]["in_position"] = True
             STATE[sym]["pos_amount"] = free
-            # entry unknown: approximate with last price
             try:
                 t = ex.fetch_ticker(sym)
                 last = float(t.get("last") or t.get("close") or 0.0)
@@ -321,6 +309,22 @@ def config():
         "state": st,
     }), 200
 
+@app.route("/envcheck", methods=["GET"])
+def envcheck():
+    # no secrets returned; only presence flags and basic info
+    has_tg_token = bool(TG_TOKEN)
+    has_tg_chat  = bool(TG_CHAT_ID)
+    ak = env_first(["MEXC_API_KEY","MEXC_KEY"])
+    sk = env_first(["MEXC_API_SECRET","MEXC_SECRET"])
+    return jsonify({
+        "ok": True,
+        "tg_token_present": has_tg_token,
+        "tg_chat_present": has_tg_chat,
+        "tg_chat_id_sample_len": len(TG_CHAT_ID) if has_tg_chat else 0,
+        "mexc_key_present": bool(ak),
+        "mexc_secret_present": bool(sk),
+        "time": now_iso(),
+    }), 200
 
 @app.route("/test/send", methods=["GET"])
 def test_send():
@@ -353,9 +357,8 @@ def webhook():
     try:
         tv_now = str(payload.get("timenow") or "")
         if tv_now.endswith("Z"):
-            from datetime import datetime, timezone
             tv_dt = datetime.strptime(tv_now, "%Y-%m-%dT%H:%M:%SZ")
-            srv_dt = datetime.utcnow()
+            srv_dt = datetime.now(timezone.utc)
             lag_ms = (srv_dt - tv_dt).total_seconds() * 1000.0
             _dbg(f"[LATENCY] TV->server ≈ {lag_ms:.0f} ms for {tv_symbol}")
     except Exception:
@@ -384,7 +387,7 @@ def webhook():
             bal = ex.fetch_balance(params={"recvWindow": MEXC_RECVWINDOW_MS})
         except Exception as e:
             _dbg(f"[PRECHK] balance error: {e}")
-            # continue anyway for sell if we think we're long
+            bal = {}
 
         if action == "buy":
             if st.get("inflight"):
@@ -414,11 +417,11 @@ def webhook():
                     st["last_action_ts"] = time.time()
                     _dbg(f"[LIVE] BUY {symbol} id={order.get('id')} filled={filled} avg={avg} gross={gross_q} fee_q={fee_q} pos_quote={st['pos_quote']}")
                     send_tg(
-                        f"🤖 <b>AANKOOP</b>\\n"
-                        f"• {symbol}\\n"
-                        f"• Prijs: ${st['entry_price']:.4f}\\n"
-                        f"• Aantal: {filled:.6f}\\n"
-                        f"• Inleg: ${st['pos_quote']:.2f}\\n"
+                        f"🤖 <b>AANKOOP</b>\n"
+                        f"• {symbol}\n"
+                        f"• Prijs: ${st['entry_price']:.4f}\n"
+                        f"• Aantal: {filled:.6f}\n"
+                        f"• Inleg: ${st['pos_quote']:.2f}\n"
                         f"• Bron: {source} ({tf})"
                     )
                 else:
@@ -432,13 +435,13 @@ def webhook():
             if st.get("inflight"):
                 _dbg("sell ignored: order already inflight")
                 return jsonify({"ok": True}), 200
+
             # amount to sell = free base (so we can exit even after reboot)
             sell_amt = 0.0
             try:
                 sell_amt = float(((bal.get("free") or {}).get(base)) or 0.0)
             except Exception:
                 pass
-            # if state has more (e.g., partials), use that
             sell_amt = max(sell_amt, float(st.get("pos_amount") or 0.0))
             if sell_amt <= 0:
                 _dbg("sell ignored: nothing to sell")
@@ -451,28 +454,25 @@ def webhook():
                 if filled > 0:
                     st["pos_amount"] = max(0.0, float(st.get("pos_amount") or 0.0) - filled)
                     if st["pos_amount"] <= 1e-9:
-                        # closed
                         entry = float(st.get("entry_price") or price or avg)
                         pnl = net_out - float(st.get("pos_quote") or (filled * entry))
                         st["in_position"] = False
                         st["entry_price"] = 0.0
                         st["pos_quote"] = 0.0
                     else:
-                        # partial
                         entry = float(st.get("entry_price") or price or avg)
-                        # scale quote down proportionally
                         st["pos_quote"] = max(0.0, float(st["pos_quote"]) - (filled * entry))
                         pnl = net_out - (filled * entry)
 
                     st["last_action_ts"] = time.time()
                     _dbg(f"[LIVE] SELL {symbol} id={order.get('id')} filled={filled} avg={avg} gross={gross_q} fee_q={fee_q} net_out={net_out}")
                     send_tg(
-                        f"🤖 <b>VERKOOP</b>\\n"
-                        f"• {symbol}\\n"
-                        f"• Prijs: ${avg if avg>0 else price:.4f}\\n"
-                        f"• Aantal: {filled:.6f}\\n"
-                        f"• Ontvangen: ${net_out:.2f}\\n"
-                        f"• P&L (approx): ${pnl:.2f}\\n"
+                        f"🤖 <b>VERKOOP</b>\n"
+                        f"• {symbol}\n"
+                        f"• Prijs: ${avg if avg>0 else price:.4f}\n"
+                        f"• Aantal: {filled:.6f}\n"
+                        f"• Ontvangen: ${net_out:.2f}\n"
+                        f"• P&L (approx): ${pnl:.2f}\n"
                         f"• Bron: {source} ({tf})"
                     )
                 else:
