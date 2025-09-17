@@ -1071,6 +1071,7 @@ def advisor_admin_tweak():
 def webhook():
     global in_position, entry_price, capital, sparen, last_action_ts, entry_ts, pos_amount, pos_quote, tpsl_state
 
+    # Secret guard
     if WEBHOOK_SECRET:
         if request.headers.get("X-Webhook-Secret", "") != WEBHOOK_SECRET:
             return "Unauthorized", 401
@@ -1080,8 +1081,9 @@ def webhook():
 
     action = str(data.get("action", "")).lower().strip()
     source = str(data.get("source", "unknown")).lower().strip()
-    tf = str(data.get("tf", "1m")).lower().strip()
+    tf     = str(data.get("tf", "1m")).lower().strip()
 
+    # Prijs
     try:
         price = float(data.get("price", 0) or 0.0)
     except Exception:
@@ -1093,7 +1095,7 @@ def webhook():
     tv_price = price
 
     # --- Symbool uit payload + guard/normalisatie ---
-    ccxt_symbol = extract_symbol_from_payload(data)
+    ccxt_symbol = extract_symbol_from_payload(data)  # verwacht bv. 'XRP/USDT'
     if not ccxt_symbol:
         _dbg("[SYMBOL] missing/unknown in alert -> ignored")
         return "OK", 200
@@ -1111,9 +1113,9 @@ def webhook():
 
     # Bind naar dit symbool
     bind(ccxt_symbol)
-    SYMBOL_TV = ccxt_symbol  # e.g., WLFI/USDT
+    SYMBOL_TV  = ccxt_symbol           # bv. 'WLFI/USDT'
     SYMBOL_STR = CURRENT_SYMBOL_STR
-    TRADE_BUDGET = get_budget(SYMBOL_TV)
+    TRADE_BUDGET_LOCAL = get_budget(SYMBOL_TV)
 
     # De-dup & cooldown
     if is_duplicate_signal(action, source, price, tf, SYMBOL_TV):
@@ -1132,54 +1134,59 @@ def webhook():
     if not allowed:
         return "OK", 200
 
-    # Ghost-guard
+    # Ghost-guard snapshot
     if LIVE_MODE and LIVE_EXCHANGE == "mexc":
         if in_position and (pos_amount <= 1e-12 or entry_price <= 0):
             _dbg(f"[GUARD] ghost detected: in_position={in_position}, pos_amount={pos_amount}, entry_price={entry_price}")
             in_position = False
             entry_price = 0.0
-            pos_amount = 0.0
-            pos_quote = 0.0
+            pos_amount  = 0.0
+            pos_quote   = 0.0
             tpsl_reset()
 
     timestamp = now_str()
 
+    # Helper voor recvWindow
+    try:
+        _rw = _recvwin()
+    except Exception:
+        _rw = globals().get("MEXC_RECV_WINDOW", 10000)
+
     # === BUY ===
     if action == "buy":
-        # Lock per symbool: beschermt tegen bind()/commit() van idle_worker
         lock = SYMBOL_LOCKS.setdefault(SYMBOL_TV, Lock())
         with lock:
-            # 0) PREBUY reality check (balans + open BUY orders)
+            # 0) PREBUY: reality check en open BUY order
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
                     ex = _mexc_live()
-                    bal = ex.fetch_balance(params={"recvWindow": _recvwin()})
-                    base = sym_pair.split("/")[0]
-                    free = float(((bal.get("free") or {}).get(base)) or 0.0)
-                    used = float(((bal.get("used") or {}).get(base)) or 0.0)
-                    total = float(((bal.get("total") or {}).get(base)) or (free + used))
-
+                    # balans check (heb je al base?)
                     try:
-                        m = ex.market(sym_pair)
-                        min_amt = float((((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0) or 0.0)
-                    except Exception:
-                        min_amt = 0.0
+                        bal = ex.fetch_balance(params={"recvWindow": _rw})
+                        base = SYMBOL_TV.split("/")[0]
+                        free = float(((bal.get("free") or {}).get(base)) or 0.0)
+                        used = float(((bal.get("used") or {}).get(base)) or 0.0)
+                        total = float(((bal.get("total") or {}).get(base)) or (free + used))
+                        try:
+                            m = ex.market(SYMBOL_TV)
+                            min_amt = float((((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0) or 0.0)
+                        except Exception:
+                            min_amt = 0.0
+                        if total > max(min_amt, REHYDRATE_MIN_XRP):
+                            if not in_position or pos_amount < total * 0.999:
+                                _dbg(f"[PREBUY] exchange base_total={total} > min → mark in_position & skip")
+                            in_position = True
+                            pos_amount  = round(total, 6)
+                            if entry_price > 0 and pos_quote <= 0:
+                                pos_quote = round(entry_price * pos_amount, 6)
+                            commit(SYMBOL_TV)
+                            return "OK", 200
+                    except Exception as e_bal:
+                        _dbg(f"[PREBUY] balance check failed: {e_bal}")
 
-                    if total > max(min_amt, REHYDRATE_MIN_XRP):
-                        if not in_position or pos_amount < total * 0.999:
-                            _dbg(f"[PREBUY] exchange base_total={total} > min → mark in_position & skip")
-                        in_position = True
-                        pos_amount  = round(total, 6)
-                        if entry_price > 0 and pos_quote <= 0:
-                            pos_quote = round(entry_price * pos_amount, 6)
-                        # schrijf terug en afsluiten
-                        pos.update({"in_position": in_position, "pos_amount": pos_amount, "pos_quote": pos_quote})
-                        commit(SYMBOL_TV)
-                        return "OK", 200
-
-                    # 0b) Open BUY-order aanwezig? → skip
+                    # open BUY?
                     try:
-                        oo = ex.fetch_open_orders(sym_pair, params={"recvWindow": _recvwin()})
+                        oo = ex.fetch_open_orders(SYMBOL_TV, params={"recvWindow": _rw})
                         has_open_buy = False
                         for o in (oo or []):
                             side = (o.get("side") or o.get("type") or "").lower()
@@ -1191,25 +1198,18 @@ def webhook():
                             _dbg("[PREBUY] open BUY order bestaat al → skip")
                             commit(SYMBOL_TV)
                             return "OK", 200
-                    except Exception:
-                        pass
-
+                    except Exception as e_oo:
+                        _dbg(f"[PREBUY] fetch_open_orders failed: {e_oo}")
                 except Exception as e:
-                    _dbg(f"[PREBUY] balance/open_orders check failed: {e}")
+                    _dbg(f"[PREBUY] precheck failed: {e}")
 
-            # 1) Ghost-snapshot guard
-            if in_position and (pos_amount <= REHYDRATE_MIN_XRP or entry_price <= 0):
-                _dbg(f"[GUARD] ghost detected: in_position={in_position}, pos_amount={pos_amount}, entry_price={entry_price}")
-                commit(SYMBOL_TV)
-                return "OK", 200
-
-            # Al in positie? → geen dubbele buy
+            # 1) Al in positie?
             if in_position:
                 _dbg(f"buy ignored: already in_position at entry={entry_price}")
                 commit(SYMBOL_TV)
                 return "OK", 200
 
-            # 2) Cooldown
+            # 2) Cooldown (zekerheid naast global helper)
             now_ts = time.time()
             if now_ts - last_action_ts < MIN_TRADE_COOLDOWN_S:
                 _dbg(f"buy ignored: cooldown {MIN_TRADE_COOLDOWN_S}s not elapsed")
@@ -1217,19 +1217,19 @@ def webhook():
                 return "OK", 200
 
             # 3) Trend filter
-            ok, ma = trend_ok(price, sym_pair)
+            ok, ma = trend_ok(price, SYMBOL_TV)
             _dbg(f"trend_ok={ok} ma={ma:.6f} price={price:.6f}")
             if not ok:
                 _dbg("blocked by trend filter")
                 commit(SYMBOL_TV)
                 return "OK", 200
 
-            # 4) Order plaatsen (MEXC: BUY via quoteOrderQty)
+            # 4) Order
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
-                    order = _place_mexc_market(sym_pair, "buy", get_budget(SYMBOL_TV), price)
+                    order = _place_mexc_market(SYMBOL_TV, "buy", TRADE_BUDGET_LOCAL, price)
                     ex = _mexc_live()
-                    avg2, filled2, gross_q, fee_q, net_in = _order_quote_breakdown(ex, sym_pair, order, "buy")
+                    avg2, filled2, gross_q, fee_q, net_in = _order_quote_breakdown(ex, SYMBOL_TV, order, "buy")
 
                     price      = float(avg2 or price or 0.0)
                     pos_amount = float(filled2 or 0.0)
@@ -1237,9 +1237,9 @@ def webhook():
                     if pos_quote <= 0 and pos_amount > 0:
                         pos_quote = round(price * pos_amount, 6)
 
-                    _dbg(f"[LIVE] MEXC BUY {sym_pair} id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
+                    _dbg(f"[LIVE] MEXC BUY {SYMBOL_TV} id={order.get('id')} filled={pos_amount} avg={price} gross={gross_q} fee_q={fee_q} pos_quote={pos_quote}")
 
-                    # 0-fill/ghost guard
+                    # Zero-fill guard
                     if pos_amount <= 0 or pos_quote <= 0:
                         _dbg("[LIVE] BUY zero-fill detected → skip marking position")
                         commit(SYMBOL_TV)
@@ -1247,7 +1247,6 @@ def webhook():
 
                 except Exception as e:
                     msg = str(e).lower()
-                    # Netjes skippen i.p.v. 500 bij te weinig USDT / min notional
                     if "insufficient" in msg or "min cost" in msg or "min_cost" in msg:
                         _dbg(f"[LIVE] BUY skipped: {e}")
                         commit(SYMBOL_TV)
@@ -1256,50 +1255,33 @@ def webhook():
                     commit(SYMBOL_TV)
                     return "LIVE BUY failed", 500
             else:
-                pos_amount = float(get_budget(SYMBOL_TV)) / float(price or 1e-12)
-                pos_quote  = float(get_budget(SYMBOL_TV))
+                pos_amount = float(TRADE_BUDGET_LOCAL) / float(price or 1e-12)
+                pos_quote  = float(TRADE_BUDGET_LOCAL)
 
             # 5) State bijwerken
             entry_price    = float(price if pos_amount > 0 else 0.0)
             in_position    = bool(pos_amount and pos_amount > REHYDRATE_MIN_XRP)
             last_action_ts = now_ts
             entry_ts       = now_ts
-
-            pos.update({
-                "in_position": in_position,
-                "pos_amount": round(pos_amount, 6),
-                "pos_quote": round(pos_quote, 6),
-                "entry_price": entry_price,
-                "entry_ts": entry_ts,
-                "last_action_ts": last_action_ts,
-            })
             tpsl_on_buy(entry_price)
 
-            # 6) Telegram + logging (safe)
-            tv_show  = float(tv_price or price or 0.0)
-            base_for_delta = tv_show if tv_show else price
-            delta_txt = f"  (Δ {(price / base_for_delta - 1) * 100:+.2f}%)" if (base_for_delta and price) else ""
-            source_h  = ht(source)
-            advisor_h = ht(advisor_reason or "n/a")
-            tf_h      = ht(tf)
-            ts        = timestamp or now_str()
-
+            # 6) Telegram + logging
+            delta_txt = f"  (Δ {(price / tv_price - 1) * 100:+.2f}%)" if tv_price else ""
             send_tg(
-                f"""🟢 <b>[{sym_pair}] AANKOOP</b>
-📹 TV prijs: ${tv_show:.6f}
+                f"""🟢 <b>[{SYMBOL_TV}] AANKOOP</b>
+📹 TV prijs: ${float(tv_price or price):.6f}
 🎯 Fill (MEXC): ${float(price or 0.0):.6f}{delta_txt}
-🧠 Signaalbron: {source_h} | {advisor_h}
-🕒 TF: {tf_h}
+🧠 Signaalbron: {ht(source)} | {ht(advisor_reason)}
+🕒 TF: {ht(tf)}
 💰 Handelssaldo: €{capital:.2f}
 💼 Spaarrekening: €{sparen:.2f}
 📈 Totale waarde: €{capital + sparen:.2f}
-🔐 Tradebedrag: €{get_budget(SYMBOL_TV):.2f}
-🔗 Tijd: {ts}"""
+🔐 Tradebedrag: €{float(TRADE_BUDGET_LOCAL):.2f}
+🔗 Tijd: {timestamp}"""
             )
-            log_trade("buy", float(price or 0.0), 0.0, source, tf, sym_pair)
+            log_trade("buy", float(price or 0.0), 0.0, source, tf, SYMBOL_TV)
             commit(SYMBOL_TV)
             return "OK", 200
-
 
     # === SELL ===
     if action == "sell":
@@ -1322,11 +1304,10 @@ def webhook():
                 try:
                     ex = _mexc_live()
 
-                    # --- EXCHANGE RECONCILE: klopt onze positie met de beurs? ---
+                    # Reconcile: klopt lokale state?
                     try:
-                        bal  = ex.fetch_balance()
+                        bal  = ex.fetch_balance(params={"recvWindow": _rw})
                         base = SYMBOL_TV.split('/')[0]
-                        free_base  = float(((bal.get('free')  or {}).get(base)) or 0.0)
                         total_base = float(((bal.get('total') or {}).get(base)) or 0.0)
                         if total_base <= 1e-12:
                             _dbg(f"[RECON] {SYMBOL_TV} exchange total=0 → flatten local state")
@@ -1339,19 +1320,17 @@ def webhook():
                     except Exception as e_bal:
                         _dbg(f"[RECON] fetch_balance failed: {e_bal}")
 
-                    # veilige sell-amount bepalen (met fallback als /account faalt)
+                    # veilige amount bepalen
                     try:
                         amt, info = _prepare_sell_amount(ex, SYMBOL_TV, pos_amount0)
                         _dbg(f"[SELL PREP] {SYMBOL_TV} info={info}")
                     except Exception as e_prep:
                         _dbg(f"[SELL PREP] balance fetch failed: {e_prep} → fallback to snapshot")
-                        # bepaal min_amt uit markets; val terug op pos_amount0
-                        min_amt = 0.0
                         try:
                             m = ex.market(SYMBOL_TV)
                             min_amt = float((((m.get('limits') or {}).get('amount') or {}).get('min') or 0.0) or 0.0)
                         except Exception:
-                            pass
+                            min_amt = 0.0
                         raw_amt = max(float(pos_amount0), float(min_amt))
                         try:
                             amt = float(ex.amount_to_precision(SYMBOL_TV, raw_amt))
@@ -1360,32 +1339,30 @@ def webhook():
                         info = {"min_amt": min_amt, "free_amt": None, "desired": pos_amount0, "final_amt": amt}
 
                     if amt <= 0.0:
-                        _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount0}, free={info.get('free_amt')}) → dust")
-
-                        # Als de beurs free=0 meldt, check 1x total; zo ja=0 → flatten lokaal
+                        _dbg(f"[LIVE] SELL skipped: <min_amt (pos={pos_amount0}, free={info.get('free_amt') if isinstance(info, dict) else None}) → dust")
+                        # check 1x total; zo ja 0 → flatten lokaal
                         try:
-                            if float(info.get("free_amt") or 0.0) <= 1e-12:
-                                bal  = ex.fetch_balance()
-                                base = SYMBOL_TV.split('/')[0]
-                                total_base = float(((bal.get('total') or {}).get(base)) or 0.0)
-                                if total_base <= 1e-12:
-                                    _dbg(f"[RECON] {SYMBOL_TV} total=0 bij amt<=0 → flatten local state")
-                                    in_position = False
-                                    entry_price = 0.0
-                                    pos_amount  = 0.0
-                                    pos_quote   = 0.0
-                                    send_tg(
-                                        f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n"
-                                        f"🧠 Reden: reconcile_flatten (exchange total=0)\n"
-                                        f"🕒 Tijd: {now_str()}"
-                                    )
-                                    log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
-                                    commit(SYMBOL_TV)
-                                    return "OK", 200
+                            bal  = ex.fetch_balance(params={"recvWindow": _rw})
+                            base = SYMBOL_TV.split('/')[0]
+                            total_base = float(((bal.get('total') or {}).get(base)) or 0.0)
+                            if total_base <= 1e-12:
+                                _dbg(f"[RECON] {SYMBOL_TV} total=0 bij amt<=0 → flatten local state")
+                                in_position = False
+                                entry_price = 0.0
+                                pos_amount  = 0.0
+                                pos_quote   = 0.0
+                                send_tg(
+                                    f"📄 <b>[{SYMBOL_TV}] VERKOOP</b>\n"
+                                    f"🧠 Reden: reconcile_flatten (exchange total=0)\n"
+                                    f"🕒 Tijd: {now_str()}"
+                                )
+                                log_trade("sell", tv_sell, 0.0, source, tf, SYMBOL_TV)
+                                commit(SYMBOL_TV)
+                                return "OK", 200
                         except Exception:
                             pass
 
-                        if pos_amount0 <= max(info.get("min_amt", 0.0), REHYDRATE_MIN_XRP):
+                        if pos_amount0 <= max((info.get("min_amt", 0.0) if isinstance(info, dict) else 0.0), REHYDRATE_MIN_XRP):
                             in_position = False
                             entry_price = 0.0
                             pos_amount  = 0.0
@@ -1402,42 +1379,29 @@ def webhook():
                             _dbg("[LIVE] leave as dust; no order placed")
                         return "OK", 200
 
-                    # plaats order
-                    order = ex.create_order(SYMBOL_TV, "market", "sell", amt)
+                    # order plaatsen
+                    order = ex.create_order(SYMBOL_TV, "market", "sell", amt, None, {"recvWindow": _rw})
 
-                    # FAST_FILL: sla fetch loops over en vul minimale velden
-                    if FAST_FILL:
-                        order.setdefault("amount", amt)
-                        order.setdefault("filled", amt)
-                        order.setdefault("price", tv_sell)
-                        order.setdefault("average", tv_sell)
-                        order.setdefault("cost", amt * max(tv_sell, 1e-12))
-                    else:
-                        # ---- order opvullen ----
-                        oid = order.get("id")
-                        if oid:
-                            for _ in range(3):
-                                try:
-                                    time.sleep(0.25)
-                                    o2 = ex.fetch_order(oid, SYMBOL_TV)
-                                    if o2:
-                                        order = {**order, **o2}
-                                    if not order.get("trades"):
-                                        try:
-                                            trs = ex.fetch_order_trades(oid, SYMBOL_TV)
-                                            if trs:
-                                                order["trades"] = trs
-                                        except Exception:
-                                            pass
-                                    if float(order.get("filled") or 0) > 0 or float(order.get("cost") or 0) > 0:
-                                        break
-                                except Exception:
-                                    pass
+                    # breakdown + zero-fill guard
+                    avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
+                    if float(filled2 or 0.0) <= 0.0:
+                        _dbg("[LIVE] SELL zero-fill detected → no state change, no TG")
+                        commit(SYMBOL_TV)
+                        return "OK", 200
+
+                    display_fill = float(avg2 or tv_sell or 0.0)
+                    filled       = float(filled2 or 0.0)
+
+                    inleg_quote = float(pos_quote0)
+                    if pos_amount0 > 0 and filled < pos_amount0:
+                        inleg_quote = inleg_quote * (filled / pos_amount0)
+
+                    revenue_net  = float(net_out or 0.0)
+                    winst_bedrag = round(revenue_net - inleg_quote, 2)
+                    _dbg(f"[LIVE] MEXC SELL {SYMBOL_TV} id={order.get('id')} filled={filled} avg={display_fill} net_out={revenue_net} pnl={winst_bedrag}")
 
                 except Exception as e_sell:
                     msg = str(e_sell).lower()
-
-                    # Specifiek: oversold/insufficient → flatten i.p.v. blijven hangen
                     if "oversold" in msg or "insufficient" in msg:
                         _dbg("[LIVE] MEXC SELL oversold/insufficient → flatten local state")
                         in_position = False
@@ -1446,52 +1410,13 @@ def webhook():
                         entry_price = 0.0
                         commit(SYMBOL_TV)
                         return "OK", 200
-
-                    # één retry met minimaal toelaatbare amount
-                    if "minimum amount" in msg or "precision" in msg or "min" in msg:
-                        min_retry = info.get("min_amt", 0.0) if 'info' in locals() else 0.0
-                        try:
-                            free_amt = float(info.get("free_amt", 0.0)) if 'info' in locals() else 0.0
-                        except Exception:
-                            free_amt = 0.0
-                        if free_amt >= min_retry and min_retry > 0:
-                            try:
-                                retry_amt = float(ex.amount_to_precision(SYMBOL_TV, min_retry))
-                                _dbg(f"[SELL RETRY] using min_amt={retry_amt}")
-                                order = ex.create_order(SYMBOL_TV, "market", "sell", retry_amt)
-                            except Exception as e2:
-                                _dbg(f"[LIVE] SELL retry failed: {e2}")
-                                commit(SYMBOL_TV)
-                                return "OK", 200
-                    else:
-                        _dbg(f"[LIVE] MEXC SELL error: {e_sell}")
-                        commit(SYMBOL_TV)
-                        return "OK", 200
-
-                # ---- order opvullen en PnL berekenen ----
-                avg2, filled2, gross_q, fee_q, net_out = _order_quote_breakdown(ex, SYMBOL_TV, order, "sell")
-                if float(filled2 or 0.0) <= 0.0:
-                    _dbg("[LIVE] SELL zero-fill detected → no state change, no TG")
+                    _dbg(f"[LIVE] MEXC SELL error: {e_sell}")
                     commit(SYMBOL_TV)
                     return "OK", 200
-
-                display_fill = float(avg2 or tv_sell or 0.0)
-                filled       = float(filled2 or 0.0)
-
-                inleg_quote = float(pos_quote0)
-                if pos_amount0 > 0 and filled < pos_amount0:
-                    inleg_quote = inleg_quote * (filled / pos_amount0)
-
-                revenue_net  = float(net_out or 0.0)
-                winst_bedrag = round(revenue_net - inleg_quote, 2)
-
-                _dbg(f"[LIVE] MEXC SELL {SYMBOL_TV} id={order.get('id')} filled={filled} avg={display_fill} net_out={revenue_net} pnl={winst_bedrag}")
-
             else:
-                # Simulatie-pad
-                sim_price = float(display_fill or tv_sell or 0.0)
-                if entry_price > 0 and sim_price > 0:
-                    verkoop_bedrag = sim_price * get_budget(SYMBOL_TV) / entry_price
+                # simulatie
+                if entry_price > 0:
+                    verkoop_bedrag = price * get_budget(SYMBOL_TV) / entry_price
                     winst_bedrag   = round(verkoop_bedrag - get_budget(SYMBOL_TV), 2)
 
             # Boekhouding
@@ -1507,7 +1432,7 @@ def webhook():
                     sparen  -= tekort
                     capital += tekort
 
-            # Positie bijwerken met snapshot (partial/full)
+            # Positie bijwerken (partial/full)
             if LIVE_MODE and LIVE_EXCHANGE == "mexc":
                 try:
                     filled  # type: ignore
@@ -1539,29 +1464,25 @@ def webhook():
             resultaat = "Winst" if winst_bedrag >= 0 else "Verlies"
             rest_txt  = f"\n🪙 Resterend: {pos_amount:.4f} @ ~${entry_price:.6f}" if in_position else ""
 
-            # Safe vars voor bericht
-            tv_show  = float(tv_price or display_fill or 0.0)
-            source_h = ht(source)
-            advisor_h= ht(advisor_reason or "n/a")
-            tf_h     = ht(tf)
-            ts       = timestamp or now_str()
-
             send_tg(
                 f"""📄 <b>[{SYMBOL_TV}] VERKOOP</b>
-📹 TV prijs: ${tv_show:.6f}
-🎯 Fill (MEXC): ${display_fill:.6f}{delta_txt}
-🧠 Signaalbron: {source_h} | {advisor_h}
-🕒 TF: {tf_h}
+📹 TV prijs: ${float(tv_sell or 0.0):.6f}
+🎯 Fill (MEXC): ${float(display_fill or 0.0):.6f}{delta_txt}
+🧠 Signaalbron: {ht(source)} | {ht(advisor_reason)}
+🕒 TF: {ht(tf)}
 💰 Handelssaldo: €{capital:.2f}
 💼 Spaarrekening: €{sparen:.2f}
 📈 {resultaat}: €{winst_bedrag:.2f}
 📈 Totale waarde: €{capital + sparen:.2f}
-🔐 Tradebedrag: €{get_budget(SYMBOL_TV):.2f}
-🔗 Tijd: {ts}{rest_txt}"""
+🔐 Tradebedrag: €{float(get_budget(SYMBOL_TV)):.2f}
+🔗 Tijd: {timestamp}{rest_txt}"""
             )
-            log_trade("sell", display_fill, winst_bedrag, source, tf, SYMBOL_TV)
+            log_trade("sell", float(display_fill or 0.0), float(winst_bedrag or 0.0), source, tf, SYMBOL_TV)
             commit(SYMBOL_TV)
             return "OK", 200
+
+    # Geen actie
+    return "OK", 200
 
 # --------------- Forced exits ---------------
 def _do_forced_sell(price: float, reason: str, source: str = "forced_exit", tf: str = "1m") -> bool:
