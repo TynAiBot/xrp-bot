@@ -925,10 +925,14 @@ def _rehydrate_all_symbols():
 # --------------- Flask ----------------
 app = Flask(__name__)
 
+# Landing/health on "/"
+@app.route("/", methods=["GET", "HEAD"])
+def root():
+    return "OK", 200
+
 @app.route("/health")
 def health():
     return "OK", 200
-
 
 @app.route("/config", methods=["GET"])
 def config_view():
@@ -973,7 +977,6 @@ def config_view():
         "budgets": TRADEABLE,
     }
     return jsonify(payload)
-
 
 # --- Advisor endpoints ---
 @app.route("/advisor", methods=["GET", "POST"])
@@ -1701,7 +1704,6 @@ def idle_worker():
             print(f"[IDLE] loop error: {e}")
             continue
 
-
 # --------------- Main ---------------
 if __name__ == "__main__":
     # advisor store
@@ -1722,6 +1724,14 @@ if __name__ == "__main__":
     except Exception as e:
         _dbg(f"[REHYDRATE] all symbols failed: {e}")
 
+    # log effective conf from env (zichtbaar in logs na deploy)
+    try:
+        rw = os.getenv("MEXC_RECV_WINDOW", "5000")
+        to = os.getenv("CCXT_TIMEOUT_MS", "7000")
+        _dbg(f"[CONF] MEXC_RECV_WINDOW={rw} CCXT_TIMEOUT_MS={to}")
+    except Exception:
+        pass
+
     # warm-up: cache de MEXC client zodat de eerste order geen extra latency heeft
     def _warmup():
         try:
@@ -1739,4 +1749,5 @@ if __name__ == "__main__":
 
     _dbg(f"✅ Webhook server op http://0.0.0.0:{PORT}/webhook — symbols: {list(TRADEABLE.keys())}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
