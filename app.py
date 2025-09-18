@@ -6,10 +6,12 @@ MEXC 2-pair webhook bot with Telegram alerts (robust core).
 - Budget per pair (default 500 USDT), via ENV
 - Dedup (strict + detailed), per-symbol locks, in-flight guard
 - Entry lockout to avoid back-to-back buys (ENTRY_LOCK_S)
+- Per-candle lock: max 1 BUY/SELL per bartime per symbol (PER_BAR_LOCK)
 - Zero-fill fix: poll fetch_order until fill/timeout
 - Rehydrate from balances at startup (sell uses free base)
 - Latency log TV->server
 - Endpoints: /, /health, /config, /envcheck, /test/send, /webhook
+- Tolerant webhook parser (handles text/plain and nearly-JSON bodies)
 """
 
 import os
@@ -49,6 +51,13 @@ def env_int(name: str, default: int = 0) -> int:
         except Exception:
             return int(default)
 
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    return s in ("1","true","t","yes","y","on")
+
 def _dbg(msg: str):
     print(f"[SIGDBG] {msg}", flush=True)
 
@@ -85,7 +94,8 @@ CCXT_TIMEOUT_MS    = env_int("CCXT_TIMEOUT_MS", 10000)
 COOLDOWN_S         = env_int("MIN_TRADE_COOLDOWN_S", 0)
 DEDUP_WINDOW_S     = env_int("DEDUP_WINDOW_S", 20)
 STRICT_DEDUP_S     = env_int("STRICT_DEDUP_S", 3)   # duplicates within N sec regardless of price/source
-ENTRY_LOCK_S       = env_int("ENTRY_LOCK_S", 2)     # min seconds between successful entries per symbol
+ENTRY_LOCK_S       = env_int("ENTRY_LOCK_S", 2)     # min seconds between 2 entries per symbol
+PER_BAR_LOCK       = env_bool("PER_BAR_LOCK", True) or env_bool("BAR_LOCK", False)  # one action per bar
 
 # ------------- telegram -------------
 def send_tg(text_html: str) -> bool:
@@ -149,6 +159,7 @@ def mexc() -> ccxt.mexc:
 SYMBOL_LOCKS: Dict[str, Lock] = {s: Lock() for s in SYMBOLS}
 last_signal_key_ts: Dict[Tuple[str, str, str, float, str], float] = {}
 last_minimal_ts: Dict[Tuple[str, str], float] = {}
+LAST_BAR: Dict[Tuple[str, str], str] = {}  # (symbol, action) -> bartime
 
 STATE: Dict[str, Dict[str, Any]] = {
     s: {
@@ -308,6 +319,7 @@ def config():
         "dedup_window_s": DEDUP_WINDOW_S,
         "strict_dedup_s": STRICT_DEDUP_S,
         "entry_lock_s": ENTRY_LOCK_S,
+        "per_bar_lock": PER_BAR_LOCK,
         "state": st,
     }), 200
 
@@ -337,9 +349,35 @@ def webhook():
     ct = request.headers.get("Content-Type", "")
     raw = request.get_data(as_text=True)
     _dbg(f"/webhook hit ct={ct} raw={raw!r}")
+    payload = None
+    # 1) normal JSON
     try:
-        payload = request.get_json(force=True, silent=False)
+        payload = request.get_json(force=False, silent=True)
     except Exception:
+        payload = None
+    # 2) tolerant parser (text/plain or nearly-JSON)
+    if payload is None:
+        cand = (raw or "").strip()
+        if cand:
+            import json as _json, re as _re
+            m = _re.search(r"\\{[\\s\\S]*\\}", cand)
+            attempts = []
+            if m:
+                attempts.append(m.group(0))
+            attempts.append(cand)
+            if not cand.startswith("{") and '"action"' in cand and '"symbol"' in cand:
+                fixed = "{" + cand
+                if not cand.rstrip().endswith("}"):
+                    fixed += "}"
+                attempts.insert(0, fixed)
+            for t in attempts:
+                try:
+                    payload = _json.loads(t)
+                    _dbg("[PARSE] recovered JSON from tolerant parser")
+                    break
+                except Exception:
+                    continue
+    if payload is None:
         _dbg("bad_json")
         return jsonify({"ok": True, "skip": "bad_json"}), 200
 
@@ -348,11 +386,23 @@ def webhook():
     source = str(payload.get("source") or "")
     tf = str(payload.get("tf") or payload.get("timeframe") or "")
     price = float(payload.get("price") or 0.0)
+    bartime = str(payload.get("bartime") or payload.get("bar_time") or payload.get("bar") or "")
 
     if not action or not tv_symbol:
         return jsonify({"ok": True, "skip": "missing action/symbol"}), 200
 
     symbol = tv_to_ccxt(tv_symbol)
+
+    # Per-candle lock: max 1 action per symbol per bartime
+    try:
+        if PER_BAR_LOCK and bartime:
+            bk = (symbol, action)
+            if LAST_BAR.get(bk) == bartime:
+                _dbg(f"[BARLOCK] ignore {action} for {symbol} at bartime={bartime}")
+                return jsonify({"ok": True, "skip": "barlock"}), 200
+            LAST_BAR[bk] = bartime
+    except Exception as _e:
+        _dbg(f"[BARLOCK] warn: {_e}")
 
     # Latency measure (if timenow present)
     try:
@@ -421,11 +471,11 @@ def webhook():
                     st["last_entry_ts"] = st["last_action_ts"]
                     _dbg(f"[LIVE] BUY {symbol} id={order.get('id')} filled={filled} avg={avg} gross={gross_q} fee_q={fee_q} pos_quote={st['pos_quote']}")
                     send_tg(
-                        f"🤖 <b>AANKOOP</b>\n"
-                        f"• {symbol}\n"
-                        f"• Prijs: ${st['entry_price']:.4f}\n"
-                        f"• Aantal: {filled:.6f}\n"
-                        f"• Inleg: ${st['pos_quote']:.2f}\n"
+                        f"🤖 <b>AANKOOP</b>\\n"
+                        f"• {symbol}\\n"
+                        f"• Prijs: ${st['entry_price']:.4f}\\n"
+                        f"• Aantal: {filled:.6f}\\n"
+                        f"• Inleg: ${st['pos_quote']:.2f}\\n"
                         f"• Bron: {source} ({tf})"
                     )
                 else:
@@ -469,12 +519,12 @@ def webhook():
                     st["last_action_ts"] = time.time()
                     _dbg(f"[LIVE] SELL {symbol} id={order.get('id')} filled={filled} avg={avg} gross={gross_q} fee_q={fee_q} net_out={net_out}")
                     send_tg(
-                        f"🤖 <b>VERKOOP</b>\n"
-                        f"• {symbol}\n"
-                        f"• Prijs: ${avg if avg>0 else price:.4f}\n"
-                        f"• Aantal: {filled:.6f}\n"
-                        f"• Ontvangen: ${net_out:.2f}\n"
-                        f"• P&L (approx): ${pnl:.2f}\n"
+                        f"🤖 <b>VERKOOP</b>\\n"
+                        f"• {symbol}\\n"
+                        f"• Prijs: ${avg if avg>0 else price:.4f}\\n"
+                        f"• Aantal: {filled:.6f}\\n"
+                        f"• Ontvangen: ${net_out:.2f}\\n"
+                        f"• P&L (approx): ${pnl:.2f}\\n"
                         f"• Bron: {source} ({tf})"
                     )
                 else:
