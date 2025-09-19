@@ -96,6 +96,8 @@ DEDUP_WINDOW_S     = env_int("DEDUP_WINDOW_S", 20)
 STRICT_DEDUP_S     = env_int("STRICT_DEDUP_S", 3)   # duplicates within N sec regardless of price/source
 ENTRY_LOCK_S       = env_int("ENTRY_LOCK_S", 2)     # min seconds between 2 entries per symbol
 PER_BAR_LOCK       = env_bool("PER_BAR_LOCK", True) or env_bool("BAR_LOCK", False)  # one action per bar
+PER_BAR_LOCK_BUY   = env_bool("PER_BAR_LOCK_BUY", PER_BAR_LOCK) or env_bool("BAR_LOCK_BUY", False)
+PER_BAR_LOCK_SELL  = env_bool("PER_BAR_LOCK_SELL", PER_BAR_LOCK) or env_bool("BAR_LOCK_SELL", False)
 
 # ------------- telegram -------------
 def send_tg(text_html: str) -> bool:
@@ -320,6 +322,8 @@ def config():
         "strict_dedup_s": STRICT_DEDUP_S,
         "entry_lock_s": ENTRY_LOCK_S,
         "per_bar_lock": PER_BAR_LOCK,
+        "per_bar_lock_buy": PER_BAR_LOCK_BUY,
+        "per_bar_lock_sell": PER_BAR_LOCK_SELL,
         "state": st,
     }), 200
 
@@ -395,7 +399,8 @@ def webhook():
 
     # Per-candle lock: max 1 action per symbol per bartime
     try:
-        if PER_BAR_LOCK and bartime:
+        apply_lock = ((action == "buy" and PER_BAR_LOCK_BUY) or (action == "sell" and PER_BAR_LOCK_SELL))
+        if apply_lock and bartime:
             bk = (symbol, action)
             if LAST_BAR.get(bk) == bartime:
                 _dbg(f"[BARLOCK] ignore {action} for {symbol} at bartime={bartime}")
