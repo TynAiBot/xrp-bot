@@ -28,6 +28,44 @@ from flask import Flask, request, jsonify
 import ccxt
 
 # ------------- helpers -------------
+def normalize_tf(tf: str) -> str:
+    """
+    Normaliseer TV interval naar: 1m/3m/5m/15m/30m/45m, 1h/2h/4h/6h/8h/12h,
+    1d, 1w, 1M. Accepteert ook '1','3','5','60','240','D','W','M', etc.
+    """
+    if tf is None:
+        return ""
+    s = str(tf).strip()
+    if not s:
+        return ""
+    u = s.upper()
+
+    # pure getal = minuten of uren
+    if u.isdigit():
+        n = int(u)
+        if n < 60:
+            return f"{n}m"
+        else:
+            h = n // 60
+            return f"{h}h"
+
+    # veelvoorkomende korte codes
+    if u in ("D", "1D"):
+        return "1d"
+    if u in ("W", "1W"):
+        return "1w"
+    if u in ("M", "1M", "1MO"):
+        return "1M"
+
+    # reeds in notatie als '1m','5m','1h','4h','1d','1w','1M'
+    # maak consequent: minuten/uren/dagen/weken lowercase, maand '1M' met hoofdletter M
+    ss = s.strip()
+    if ss.lower().endswith(("m","h","d","w")):
+        return ss.lower()
+    if ss.lower().endswith("mo"):
+        return "1M"
+    return ss
+
 
 def sym_label(symbol: str) -> str:
     try:
@@ -164,9 +202,9 @@ def allowed_tfs_for(symbol_ccxt: str):
     tfs = set()
     for v in vals:
         for item in str(v).replace(";",",").split(","):
-            s = item.strip().lower()
+            s = item.strip()
             if s:
-                tfs.add(s)
+                tfs.add(normalize_tf(s))
     return tfs
 # ------------- config -------------
 PORT = env_int("PORT", 10000)
@@ -672,7 +710,8 @@ def webhook():
     action = str(payload.get("action") or "").lower().strip()
     tv_symbol = str(payload.get("symbol") or payload.get("SYMBOL") or "").upper().replace(" ", "")
     source = str(payload.get("source") or "")
-    tf = str(payload.get("tf") or payload.get("timeframe") or "")
+    raw_tf = str(payload.get("tf") or payload.get("timeframe") or "")
+    tf = normalize_tf(raw_tf)
     price = float(payload.get("price") or 0.0)
     bartime = str(payload.get("bartime") or payload.get("bar_time") or payload.get("bar") or "")
 
@@ -684,7 +723,7 @@ def webhook():
     # Timeframe allowlist per symbol from ENV
     try:
         atfs = allowed_tfs_for(symbol)
-        if atfs and (tf or "").lower() not in atfs:
+        if atfs and tf not in atfs:
             _dbg(f"[TF-FILTER] skip {symbol} tf={tf} not allowed (allowed={sorted(list(atfs))})")
             return jsonify({"ok": True, "skip": "tf_not_allowed"}), 200
     except Exception as _e:
