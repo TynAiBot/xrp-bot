@@ -16,15 +16,61 @@ MEXC 2-pair webhook bot with Telegram alerts (robust core).
 
 import os
 import time
+import json
+from pathlib import Path
 from datetime import datetime, timezone
-from threading import Lock
-from typing import Dict, Any, Tuple
+from zoneinfo import ZoneInfo
+from threading import Lock, Thread
+from typing import Dict, Any, Tuple, List
 
 import requests
 from flask import Flask, request, jsonify
 import ccxt
 
 # ------------- helpers -------------
+
+def sym_label(symbol: str) -> str:
+    try:
+        return symbol.split("/")[0]
+    except Exception:
+        return symbol.replace("/", "")
+
+def eur_rate() -> float:
+    """USD -> EUR conversion via ENV USD_TO_EUR (default 0.92)."""
+    try:
+        v = float(os.getenv("USD_TO_EUR", 0.92))
+        return max(v, 0.0001)
+    except Exception:
+        return 0.92
+
+def fmt_eur(x: float) -> str:
+    """Format number as € with EU comma decimals."""
+    try:
+        s = f"{x:,.2f}"
+        s = s.replace(",", "_").replace(".", ",").replace("_", ".")
+        return f"€{s}"
+    except Exception:
+        return f"€{x:.2f}"
+
+def fmt_usd(x: float, decimals: int = 4) -> str:
+    return f"${x:.{decimals}f}"
+
+def local_now():
+    tzname = os.getenv("TIMEZONE", "Europe/Amsterdam")
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = timezone.utc
+    return datetime.now(tz)
+
+def fmt_dt(dt: datetime) -> str:
+    tzname = os.getenv("TIMEZONE", "Europe/Amsterdam")
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = timezone.utc
+    return dt.astimezone(tz).strftime("%d-%m-%Y %H:%M:%S")
+
 def env_first(names, default=""):
     for n in names:
         v = os.getenv(n)
@@ -73,18 +119,61 @@ def tv_to_ccxt(symbol_tv: str) -> str:
         return f"{base}/USDT"
     return s
 
+
+# --- dynamic symbols/budgets/tf allowlist helpers ---
+def parse_symbols_env():
+    raw = os.getenv("SYMBOLS", "")
+    symbols = []
+    for tok in raw.replace(";", ",").split(","):
+        s = tok.strip().upper()
+        if not s:
+            continue
+        if "/" not in s and s.endswith("USDT"):
+            s = f"{s[:-4]}/USDT"
+        symbols.append(s)
+    return symbols
+
+def make_budgets_for(symbols):
+    out = {}
+    for sym in symbols:
+        base, quote = sym.split("/")
+        basequote = (base + quote).upper()
+        val = os.getenv(f"BUDGET_{base.upper()}")
+        if val is None:
+            val = os.getenv(f"BUDGET_{basequote}")
+        try:
+            out[sym] = float(val) if val is not None else 500.0
+        except Exception:
+            out[sym] = 500.0
+    return out
+
+def allowed_tfs_for(symbol_ccxt: str):
+    if "/" in symbol_ccxt:
+        base, quote = symbol_ccxt.split("/")
+    else:
+        base, quote = symbol_ccxt, ""
+    basequote = (base + quote).upper() if quote else base.upper()
+    keys = [f"ALLOW_TF_{base.upper()}", f"ALLOW_TF_{basequote}"]
+    vals = []
+    for k in keys:
+        v = os.getenv(k)
+        if v and str(v).strip() != "":
+            vals.append(v)
+    if not vals:
+        return set()
+    tfs = set()
+    for v in vals:
+        for item in str(v).replace(";",",").split(","):
+            s = item.strip().lower()
+            if s:
+                tfs.add(s)
+    return tfs
 # ------------- config -------------
 PORT = env_int("PORT", 10000)
 
-SYMBOLS = [
-    "XRP/USDT",
-    "WLFI/USDT",
-]
+SYMBOLS = parse_symbols_env() or ["XRP/USDT", "WLFI/USDT"]
 
-BUDGET_USDT: Dict[str, float] = {
-    "XRP/USDT": env_float("BUDGET_XRP", 500.0),
-    "WLFI/USDT": env_float("BUDGET_WLFI", 500.0),
-}
+BUDGET_USDT: Dict[str, float] = make_budgets_for(SYMBOLS)
 
 TG_TOKEN   = env_first(["TG_TOKEN","TELEGRAM_BOT_TOKEN","BOT_TOKEN","TELEGRAM_TOKEN"])
 TG_CHAT_ID = env_first(["TG_CHAT_ID","TELEGRAM_CHAT_ID","CHAT_ID"])
@@ -100,6 +189,9 @@ PER_BAR_LOCK_BUY   = env_bool("PER_BAR_LOCK_BUY", PER_BAR_LOCK) or env_bool("BAR
 PER_BAR_LOCK_SELL  = env_bool("PER_BAR_LOCK_SELL", PER_BAR_LOCK) or env_bool("BAR_LOCK_SELL", False)
 
 # ------------- telegram -------------
+
+BOT_TITLE = env_str("BOT_TITLE", "Scalp_bot")
+DAILY_REPORT_HHMM = env_str("DAILY_REPORT_HHMM", "23:59")
 def send_tg(text_html: str) -> bool:
     if not TG_TOKEN or not TG_CHAT_ID:
         _dbg("[TG] missing TG_TOKEN or TG_CHAT_ID")
@@ -126,6 +218,120 @@ def send_tg(text_html: str) -> bool:
             time.sleep(1 + attempt)
     return False
 
+
+# --- Telegram message builders ---
+def tg_buy_msg(symbol: str, price_usd: float, qty: float, invested_usd: float, source: str, tf: str) -> str:
+    budget_eur = eur_rate() * float(BUDGET_USDT.get(symbol, 0.0))
+    spaar_eur = savings_for(symbol)
+    total_eur = budget_eur + spaar_eur
+    now_str = fmt_dt(local_now())
+    sym_ccxt = sym_label(symbol)
+    lines = [
+        f"{BOT_TITLE}",
+        f"🟢 [{sym_ccxt}] AANKOOP",
+        f"📹 Koopprijs: {fmt_usd(price_usd, 4)}",
+        f"🧠 Signaalbron: {source or 'TV'}",
+        f"💰 Handelssaldo: {fmt_eur(budget_eur)}",
+        f"💼 Spaarrekening: {fmt_eur(spaar_eur)}",
+        f"📈 Totale waarde: {fmt_eur(total_eur)}",
+        f"🔐 Tradebedrag: {fmt_eur(eur_rate() * invested_usd)}",
+        f"🔗 Tijd: {now_str}",
+    ]
+    return "\n".join(lines)
+
+def tg_sell_msg(symbol: str, price_usd: float, qty: float, net_out_usd: float, pnl_usd: float) -> str:
+    budget_eur = eur_rate() * float(BUDGET_USDT.get(symbol, 0.0))
+    spaar_eur = savings_for(symbol)
+    total_eur = budget_eur + spaar_eur
+    now_str = fmt_dt(local_now())
+    sym_ccxt = sym_label(symbol)
+    pnl_eur = eur_rate() * pnl_usd
+    winlose = "Winst" if pnl_eur >= 0 else "Verlies"
+    lines = [
+        f"{BOT_TITLE}",
+        f"📄 [{sym_ccxt}] VERKOOP",
+        f"📹 Verkoopprijs: {fmt_usd(price_usd, 4)}",
+        f"📈 {winlose}: {fmt_eur(pnl_eur)}",
+        f"💰 Handelssaldo: {fmt_eur(budget_eur)}",
+        f"💼 Spaarrekening: {fmt_eur(spaar_eur)}",
+        f"📈 Totale waarde: {fmt_eur(total_eur)}",
+        f"🔐 Tradebedrag: {fmt_eur(budget_eur)}",
+        f"🔗 Tijd: {now_str}",
+    ]
+    return "\n".join(lines)
+
+def tg_day_report_text(day_dt: datetime) -> str:
+    tzname = os.getenv("TIMEZONE", "Europe/Amsterdam")
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = timezone.utc
+    # Filter trades for the given local date
+    day = day_dt.astimezone(tz).date()
+    trades = []
+    for t in TRADE_LOG:
+        try:
+            ts = datetime.fromtimestamp(float(t.get("ts", 0.0)), tz=timezone.utc).astimezone(tz)
+            if ts.date() == day:
+                trades.append(t)
+        except Exception:
+            pass
+    # Aggregate per symbol
+    per = {}
+    for t in trades:
+        sym = t.get("symbol")
+        pnl_eur = eur_rate() * float(t.get("pnl_usd", 0.0))
+        ok = per.get(sym) or {"trades":0,"pnl_eur":0.0,"wins":0,"best":-1e18,"worst":1e18}
+        ok["trades"] += 1
+        ok["pnl_eur"] += pnl_eur
+        if pnl_eur >= 0: ok["wins"] += 1
+        ok["best"] = max(ok["best"], pnl_eur)
+        ok["worst"] = min(ok["worst"], pnl_eur)
+        per[sym] = ok
+
+    # Build lines
+    dstr = day_dt.astimezone(tz).strftime("%d-%m-%Y")
+    lines = [f"📊 Dagrapport — {dstr}"]
+    total_trades = 0
+    total_pnl = 0.0
+    best_sym = None; best_val = -1e18
+    worst_sym = None; worst_val = 1e18
+
+    for sym in SYMBOLS:
+        stat = per.get(sym, {"trades":0,"pnl_eur":0.0,"wins":0})
+        winrate = int(round(100.0 * (stat["wins"]/stat["trades"]) if stat["trades"]>0 else 0.0))
+        sym_ccxt = sym_label(sym)
+        pnl_str = f"＋{fmt_eur(stat['pnl_eur'])}" if stat["pnl_eur"] >= 0 else fmt_eur(stat["pnl_eur"])
+        lines.append(f"{sym_ccxt}: {stat['trades']} trades • {pnl_str} • winrate {winrate}%")
+        total_trades += stat["trades"]
+        total_pnl += stat["pnl_eur"]
+        if stat["trades"]>0:
+            best_val = max(best_val, stat.get("best", -1e18)); 
+            worst_val = min(worst_val, stat.get("worst", 1e18))
+            if best_val == stat.get("best", -1e18): best_sym = sym_ccxt
+            if worst_val == stat.get("worst", 1e18): worst_sym = sym_ccxt
+
+    lines.append("——————————————")
+    wr_total = 0
+    wins_total = sum(per[s]["wins"] for s in per)
+    if total_trades>0:
+        wr_total = int(round(100.0 * wins_total/total_trades))
+    total_str = f"{'＋' if total_pnl>=0 else ''}{fmt_eur(total_pnl)}"
+    lines.append(f"Totaal: {total_trades} trades • {total_str} • winrate {wr_total}%")
+    if best_sym is not None and worst_sym is not None:
+        best_line = f"Beste: {best_sym} {'＋' if best_val>=0 else ''}{fmt_eur(best_val)}"
+        worst_line = f"Slechtste: {worst_sym} {'＋' if worst_val>=0 else ''}{fmt_eur(worst_val)}"
+        lines.append(f"{best_line}  •  {worst_line}")
+    lines.append("——————————————")
+    # Balances overview
+    for sym in SYMBOLS:
+        budget_eur = eur_rate() * float(BUDGET_USDT.get(sym, 0.0))
+        spaar_eur = savings_for(sym)
+        sym_short = sym_label(sym)
+        lines.append(f"{sym_short} saldo: Handel {fmt_eur(budget_eur)} • Spaar {fmt_eur(spaar_eur)}")
+    totvermogen = sum(eur_rate()*float(BUDGET_USDT.get(s,0.0)) + savings_for(s) for s in SYMBOLS)
+    lines.append(f"Totaal vermogen: {fmt_eur(totvermogen)}")
+    return "\n".join(lines)
 # ------------- exchange -------------
 _EX = None
 def mexc() -> ccxt.mexc:
@@ -161,7 +367,7 @@ def mexc() -> ccxt.mexc:
 SYMBOL_LOCKS: Dict[str, Lock] = {s: Lock() for s in SYMBOLS}
 last_signal_key_ts: Dict[Tuple[str, str, str, float, str], float] = {}
 last_minimal_ts: Dict[Tuple[str, str], float] = {}
-LAST_BAR: Dict[Tuple[str, str], str] = {}  # (symbol, action) -> bartime
+LAST_BAR: Dict[Tuple[str, str, str], str] = {}  # (symbol, action, tf) -> bartime
 
 STATE: Dict[str, Dict[str, Any]] = {
     s: {
@@ -175,6 +381,40 @@ STATE: Dict[str, Dict[str, Any]] = {
     } for s in SYMBOLS
 }
 
+
+# --- Savings + Trade log (persisted to JSON) ---
+SAVINGS_EUR: Dict[str, float] = {}
+TRADE_LOG: List[Dict[str, Any]] = []
+STATE_FILE = Path(os.getenv("STATE_FILE", "bot_state.json"))
+
+def _load_state_file():
+    global SAVINGS_EUR, TRADE_LOG
+    try:
+        if STATE_FILE.exists():
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            SAVINGS_EUR = {k: float(v) for k, v in (data.get("savings_eur") or {}).items()}
+            TRADE_LOG[:] = data.get("trade_log") or []
+            _dbg(f"[STATE] loaded {STATE_FILE} (savings={len(SAVINGS_EUR)}, trades={len(TRADE_LOG)})")
+    except Exception as e:
+        _dbg(f"[STATE] load warn: {e}")
+
+def _save_state_file():
+    try:
+        data = {"savings_eur": SAVINGS_EUR, "trade_log": TRADE_LOG[-2000:]}
+        STATE_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except Exception as e:
+        _dbg(f"[STATE] save warn: {e}")
+
+def savings_for(symbol: str) -> float:
+    return float(SAVINGS_EUR.get(symbol, 0.0))
+
+def add_savings(symbol: str, delta_eur: float):
+    if abs(delta_eur) <= 1e-12:
+        return
+    SAVINGS_EUR[symbol] = float(SAVINGS_EUR.get(symbol, 0.0) + delta_eur)
+    if SAVINGS_EUR[symbol] < 0:
+        SAVINGS_EUR[symbol] = 0.0
+    _save_state_file()
 def _round_amount(ex: ccxt.Exchange, symbol: str, qty: float) -> float:
     try:
         return float(ex.amount_to_precision(symbol, qty))
@@ -324,6 +564,8 @@ def config():
         "per_bar_lock": PER_BAR_LOCK,
         "per_bar_lock_buy": PER_BAR_LOCK_BUY,
         "per_bar_lock_sell": PER_BAR_LOCK_SELL,
+        "bar_lock_key": "symbol+action+tf",
+        "allowed_tfs": {s: sorted(list(allowed_tfs_for(s))) for s in SYMBOLS},
         "state": st,
     }), 200
 
@@ -347,6 +589,48 @@ def envcheck():
 def test_send():
     ok = send_tg(f"✅ TG test — {now_iso()}")
     return jsonify({"ok": bool(ok)}), 200
+
+
+@app.route("/report", methods=["GET"])
+def report():
+    # GET /report?date=YYYY-MM-DD (optional), local TZ
+    d = request.args.get("date")
+    tzname = os.getenv("TIMEZONE", "Europe/Amsterdam")
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = timezone.utc
+    if d:
+        try:
+            day_dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=tz)
+        except Exception:
+            return jsonify({"ok": False, "err": "bad date"}), 400
+    else:
+        day_dt = local_now()
+    text = tg_day_report_text(day_dt)
+    ok = send_tg(text)
+    return jsonify({"ok": bool(ok), "text": text}), 200
+
+def _daily_report_loop():
+    tzname = os.getenv("TIMEZONE", "Europe/Amsterdam")
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = timezone.utc
+    last_sent_date = None
+    hhmm = os.getenv("DAILY_REPORT_HHMM", DAILY_REPORT_HHMM)
+    while True:
+        try:
+            now = datetime.now(tz)
+            if now.strftime("%H:%M") == hhmm:
+                if last_sent_date != now.date():
+                    txt = tg_day_report_text(now)
+                    send_tg(txt)
+                    last_sent_date = now.date()
+            time.sleep(20)
+        except Exception as e:
+            _dbg(f"[REPORT] loop warn: {e}")
+            time.sleep(60)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -397,13 +681,22 @@ def webhook():
 
     symbol = tv_to_ccxt(tv_symbol)
 
+    # Timeframe allowlist per symbol from ENV
+    try:
+        atfs = allowed_tfs_for(symbol)
+        if atfs and (tf or "").lower() not in atfs:
+            _dbg(f"[TF-FILTER] skip {symbol} tf={tf} not allowed (allowed={sorted(list(atfs))})")
+            return jsonify({"ok": True, "skip": "tf_not_allowed"}), 200
+    except Exception as _e:
+        _dbg(f"[TF-FILTER] warn: {_e}")
+
     # Per-candle lock: max 1 action per symbol per bartime
     try:
         apply_lock = ((action == "buy" and PER_BAR_LOCK_BUY) or (action == "sell" and PER_BAR_LOCK_SELL))
         if apply_lock and bartime:
-            bk = (symbol, action)
+            bk = (symbol, action, tf or "")
             if LAST_BAR.get(bk) == bartime:
-                _dbg(f"[BARLOCK] ignore {action} for {symbol} at bartime={bartime}")
+                _dbg(f"[BARLOCK] ignore {action} for {symbol} at tf={tf} bartime={bartime}")
                 return jsonify({"ok": True, "skip": "barlock"}), 200
             LAST_BAR[bk] = bartime
     except Exception as _e:
@@ -550,5 +843,13 @@ if __name__ == "__main__":
     except Exception as e:
         _dbg(f"[WARMUP] MEXC init error: {e}")
     rehydrate_positions()
+    _load_state_file()
     _dbg(f"✅ Webhook server op http://0.0.0.0:{PORT}/webhook — symbols: {SYMBOLS}")
+    _dbg(f"[CONF] budgets={BUDGET_USDT}")
+    try:
+        t = Thread(target=_daily_report_loop, daemon=True)
+        t.start()
+        _dbg("[REPORT] daily scheduler started")
+    except Exception as e:
+        _dbg(f"[REPORT] scheduler warn: {e}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
