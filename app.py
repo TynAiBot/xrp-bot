@@ -317,6 +317,8 @@ def tg_day_report_text(day_dt: datetime) -> str:
     # Aggregate per symbol
     per = {}
     for t in trades:
+        if str(t.get("action", "")).lower() != "sell":
+            continue
         sym = t.get("symbol")
         pnl_eur = eur_rate() * float(t.get("pnl_usd", 0.0))
         ok = per.get(sym) or {"trades":0,"pnl_eur":0.0,"wins":0,"best":-1e18,"worst":1e18}
@@ -807,14 +809,19 @@ def webhook():
                     st["last_action_ts"] = time.time()
                     st["last_entry_ts"] = st["last_action_ts"]
                     _dbg(f"[LIVE] BUY {symbol} id={order.get('id')} filled={filled} avg={avg} gross={gross_q} fee_q={fee_q} pos_quote={st['pos_quote']}")
-                    send_tg(
-                        f"🤖 <b>AANKOOP</b>\\n"
-                        f"• {symbol}\\n"
-                        f"• Prijs: ${st['entry_price']:.4f}\\n"
-                        f"• Aantal: {filled:.6f}\\n"
-                        f"• Inleg: ${st['pos_quote']:.2f}\\n"
-                        f"• Bron: {source} ({tf})"
-                    )
+                    msg = tg_buy_msg(symbol, st['entry_price'], filled, st['pos_quote'], source, tf)
+                    send_tg(msg)
+                    TRADE_LOG.append({
+                        "ts": time.time(),
+                        "action": "buy",
+                        "symbol": symbol,
+                        "price_usd": float(st['entry_price']),
+                        "qty": float(filled),
+                        "invested_usd": float(st['pos_quote']),
+                        "source": source,
+                        "tf": tf,
+                    })
+                    _save_state_file()
                 else:
                     _dbg("[LIVE] BUY zero-fill detected → skip marking position")
             except Exception as e:
@@ -855,15 +862,20 @@ def webhook():
                         pnl = net_out - (filled * entry)
                     st["last_action_ts"] = time.time()
                     _dbg(f"[LIVE] SELL {symbol} id={order.get('id')} filled={filled} avg={avg} gross={gross_q} fee_q={fee_q} net_out={net_out}")
-                    send_tg(
-                        f"🤖 <b>VERKOOP</b>\\n"
-                        f"• {symbol}\\n"
-                        f"• Prijs: ${avg if avg>0 else price:.4f}\\n"
-                        f"• Aantal: {filled:.6f}\\n"
-                        f"• Ontvangen: ${net_out:.2f}\\n"
-                        f"• P&L (approx): ${pnl:.2f}\\n"
-                        f"• Bron: {source} ({tf})"
-                    )
+                    msg = tg_sell_msg(symbol, avg if avg>0 else price, filled, net_out, pnl)
+                    send_tg(msg)
+                    TRADE_LOG.append({
+                        "ts": time.time(),
+                        "action": "sell",
+                        "symbol": symbol,
+                        "price_usd": float(avg if avg>0 else price),
+                        "qty": float(filled),
+                        "net_out_usd": float(net_out),
+                        "pnl_usd": float(pnl),
+                        "source": source,
+                        "tf": tf,
+                    })
+                    _save_state_file()
                 else:
                     _dbg("[LIVE] SELL zero-fill detected → no state change, no TG")
             except Exception as e:
@@ -892,3 +904,45 @@ if __name__ == "__main__":
     except Exception as e:
         _dbg(f"[REPORT] scheduler warn: {e}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
+def normalize_tf(tf: str) -> str:
+    """
+    Normaliseer TV interval naar: 1m/3m/5m/15m/30m/45m, 1h/2h/4h/6h/8h/12h,
+    1d, 1w, 1M. Accepteert ook '1','3','5','60','240','D','W','M', etc.
+    Belangrijk: '1m' mag nooit als '1M' (maand) worden gelezen.
+    """
+    if tf is None:
+        return ""
+    s = str(tf).strip()
+    if not s:
+        return ""
+
+    ss = s.strip()
+    lower = ss.lower()
+
+    # 1) Als er al een expliciete eenheid staat (m/h/d/w) → gewoon die, in lowercase
+    if lower.endswith(("m", "h", "d", "w")):
+        return lower
+
+    # 2) Specifiek maand: 'M' / '1M' / '1Mo' etc.
+    # (hier pas na stap 1, zodat '1m' nooit als '1M' gezien wordt)
+    if ss in ("1M",) or lower in ("m", "1mo"):
+        return "1M"
+
+    # 3) Puur getal → minuten of uren
+    u = ss.upper()
+    if u.isdigit():
+        n = int(u)
+        return f"{n}m" if n < 60 else f"{n // 60}h"
+
+    # 4) Korte codes
+    if u in ("D", "1D"):
+        return "1d"
+    if u in ("W", "1W"):
+        return "1w"
+    if u in ("M", "1M", "1MO"):
+        return "1M"
+
+    # 5) Fallback: lowercase teruggeven
+    return lower
