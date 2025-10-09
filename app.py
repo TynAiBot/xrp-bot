@@ -271,7 +271,6 @@ def mexc():
     })
     mexc.load_markets()
 
-
 def rehydrate_positions():
     """
     Rehydrate positions from balances at startup.
@@ -288,6 +287,10 @@ def rehydrate_positions():
         
         for symbol in SYMBOLS:
             try:
+                # Init state dict if missing
+                if symbol not in STATE:
+                    STATE[symbol] = {"in_position": False, "inflight": False, "last_action_ts": 0, "last_bar_time": 0, "entry_price": 0}
+                
                 base = symbol.replace("/USDT", "")
                 free_base = balances["free"].get(base, 0)
                 _dbg(f"[REHYDRATE] {symbol} free base: {free_base}")
@@ -302,7 +305,6 @@ def rehydrate_positions():
                 _dbg(f"[REHYDRATE] Error for {symbol}: {sym_e}")
     except Exception as e:
         _dbg(f"[REHYDRATE] Fetch error: {e}")
-
 
 def _daily_report_loop():
     """
