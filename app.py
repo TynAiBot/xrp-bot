@@ -277,19 +277,31 @@ def rehydrate_positions():
     Rehydrate positions from balances at startup.
     """
     global STATE
+    if not MEXC_API_KEY or not MEXC_API_SECRET:
+        _dbg("[REHYDRATE] Skip: No API keys set")
+        return
+    
     try:
+        _dbg(f"[REHYDRATE] Fetching balances for {SYMBOLS}")
         balances = mexc.fetch_balance()
+        _dbg(f"[REHYDRATE] Balances fetched: {len(balances['free'])} assets")
+        
         for symbol in SYMBOLS:
-            base = symbol.replace("/USDT", "")
-            free_base = balances["free"].get(base, 0)
-            if free_base > 0.001:  # Threshold
-                STATE[symbol]["in_position"] = True
-                STATE[symbol]["entry_price"] = 0  # Unknown
-                _dbg(f"[REHYDRATE] {symbol} in position (free {free_base})")
-            else:
-                STATE[symbol]["in_position"] = False
+            try:
+                base = symbol.replace("/USDT", "")
+                free_base = balances["free"].get(base, 0)
+                _dbg(f"[REHYDRATE] {symbol} free base: {free_base}")
+                
+                if free_base > 0.001:  # Threshold
+                    STATE[symbol]["in_position"] = True
+                    STATE[symbol]["entry_price"] = 0  # Unknown
+                    _dbg(f"[REHYDRATE] {symbol} in position (free {free_base})")
+                else:
+                    STATE[symbol]["in_position"] = False
+            except Exception as sym_e:
+                _dbg(f"[REHYDRATE] Error for {symbol}: {sym_e}")
     except Exception as e:
-        _dbg(f"[REHYDRATE] Error: {e}")
+        _dbg(f"[REHYDRATE] Fetch error: {e}")
 
 
 def _daily_report_loop():
