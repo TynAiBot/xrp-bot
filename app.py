@@ -678,21 +678,23 @@ def webhook():
     _dbg(f"[SIGDBG] /webhook hit ct={request.content_type} raw='{raw[:100]}...'")
     
     fixed = ""
-    for attempt in range(0, fixed):  # Je originele loop voor tolerant parse
+    for attempt in range(3):  # Je originele loop voor tolerant parse
         try:
             payload = json.loads(raw)
             _dbg(f"[PARSE] JSON loaded from tolerant parser")
             break
         except Exception:
-            pass  # Je originele except-logic hier, als je wilt
+            pass
     else:
-        payload = {}
-    
-    if payload is None:
-        _dbg("[SIGDBG] bad_json")
-        return jsonify({"ok": True, "skip": "bad_json"}), 200
+        if payload is None:
+            _dbg("[SIGDBG] bad_json")
+            return jsonify({"ok": True, "skip": "bad_json"}), 200
     
     action = payload.get("action", "").lower().strip()
+    if action not in ["buy", "sell"]:
+        _dbg(f"[SKIP] Invalid action '{action}'")
+        return jsonify({"ok": True, "skipped": "invalid_action"}), 200
+    
     tv_symbol = str(payload.get("symbol") or "").upper().replace("/", "")
     tf_raw = payload.get("tf") or ""
     tf = normalize_tf(tf_raw)
@@ -702,14 +704,32 @@ def webhook():
     except ValueError:
         _dbg(f"[WARN] Invalid price '{payload.get('price')}'; fallback to current")
         try:
-            price = float(mexc.fetch_ticker('XRP/USDT')['last'])  # Live prijs fetch als fallback
+            price = float(mexc.fetch_ticker('XRP/USDT')['last'])
         except Exception as e:
             _dbg(f"[WARN] Fetch ticker error: {e}; use 0")
             price = 0.0
     
-    if action not in ["buy", "sell"]:
-        _dbg(f"[SKIP] Invalid action '{action}'")
-        return jsonify({"ok": True, "skipped": "invalid_action"}), 200
+    # Timeframe allowlist per symbol from ENV
+    try:
+        atfs = allowed_tfs_for(tv_symbol)
+        if tf not in atfs:
+            _dbg(f"[TF FILTER] skip {tv_symbol} tf={tf} not allowed ({', '.join(sorted(atfs))})")
+            return jsonify({"ok": True, "skip": "tf not allowed"}), 200
+    except Exception as e:
+        _dbg(f"[TF FILTER] warn: {e}")
+    
+    # Per-candle lock: max 1 action per symbol per bartime
+    # ... (je bestaande code voor sym_to_ccxt, buy/sell logic, etc. – plak je originele code hieronder, zoals de dedup, inflight check, etc.)
+    
+    # Voorbeeld van je bestaande buy/sell calls (voeg toe na TF-check)
+    if action == "buy":
+        # Je _ensure_spend_buy call hier
+        return _ensure_spend_buy(tv_symbol, price, source=payload.get("source", ""), tf=tf)
+    elif action == "sell":
+        # Je _market_sell_all call hier
+        return _market_sell_all(tv_symbol, price, source=payload.get("source", ""), tf=tf)
+    
+    return jsonify({"ok": True}), 200
     
     # ... (je bestaande code voor sym_to_ccxt, TF allowlist, etc. – plak die hieronder)
     
@@ -740,23 +760,35 @@ except ValueError:
 
 # ... (je bestaande code voor action/symbol check)
 
-action = payload.get("action", "").lower()
-if action not in ["buy", "sell"]:
-    _dbg(f"[SKIP] Invalid action '{action}'")
-    return jsonify({"ok": True, "skipped": "invalid_action"}), 200
-
-# ... (rest van je webhook-functie, zoals sym_to_ccxt)
-
-    symbol = tv_to_ccxt(tv_symbol)
-
-    # Timeframe allowlist per symbol from ENV
-    try:
-        atfs = allowed_tfs_for(symbol)
-        if atfs and tf not in atfs:
-            _dbg(f"[TF-FILTER] skip {symbol} tf={tf} not allowed (allowed={sorted(list(atfs))})")
-            return jsonify({"ok": True, "skip": "tf_not_allowed"}), 200
-    except Exception as _e:
-        _dbg(f"[TF-FILTER] warn: {_e}")
+        action = payload.get("action", "").lower().strip()
+        if action not in ["buy", "sell"]:
+            _dbg(f"[SKIP] Invalid action '{action}'")
+            return jsonify({"ok": True, "skipped": "invalid_action"}), 200
+        
+        tv_symbol = str(payload.get("symbol") or "").upper().replace("/", "")
+        tf_raw = payload.get("tf") or ""
+        tf = normalize_tf(tf_raw)
+        
+        try:
+            price = float(payload.get("price") or 0.0)
+        except ValueError:
+            _dbg(f"[WARN] Invalid price '{payload.get('price')}'; fallback to current")
+            try:
+                price = float(mexc.fetch_ticker('XRP/USDT')['last'])
+            except Exception as e:
+                _dbg(f"[WARN] Fetch ticker error: {e}; use 0")
+                price = 0.0
+        
+        # Timeframe allowlist per symbol from ENV
+        try:
+            atfs = allowed_tfs_for(tv_symbol)
+            if tf not in atfs:
+                _dbg(f"[TF FILTER] skip {tv_symbol} tf={tf} not allowed ({', '.join(sorted(atfs))})")
+                return jsonify({"ok": True, "skip": "tf not allowed"}), 200
+        except Exception as e:
+            _dbg(f"[TF FILTER] warn: {e}")
+        
+        # ... (je bestaande code voor sym_to_ccxt, buy/sell logic, etc. – zorg dat dit allemaal onder def webhook(): valt)
 
     # Per-candle lock: max 1 action per symbol per bartime
     try:
