@@ -674,51 +674,78 @@ def _daily_report_loop():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    ct = request.headers.get("Content-Type", "")
     raw = request.get_data(as_text=True)
-    _dbg(f"/webhook hit ct={ct} raw={raw!r}")
-    payload = None
-    # 1) normal JSON
-    try:
-        payload = request.get_json(force=False, silent=True)
-    except Exception:
-        payload = None
-    # 2) tolerant parser (text/plain or nearly-JSON)
+    _dbg(f"[SIGDBG] /webhook hit ct={request.content_type} raw='{raw[:100]}...'")
+    
+    fixed = ""
+    for attempt in range(0, fixed):  # Je originele loop voor tolerant parse
+        try:
+            payload = json.loads(raw)
+            _dbg(f"[PARSE] JSON loaded from tolerant parser")
+            break
+        except Exception:
+            pass  # Je originele except-logic hier, als je wilt
+    else:
+        payload = {}
+    
     if payload is None:
-        cand = (raw or "").strip()
-        if cand:
-            import json as _json, re as _re
-            m = _re.search(r"\\{[\\s\\S]*\\}", cand)
-            attempts = []
-            if m:
-                attempts.append(m.group(0))
-            attempts.append(cand)
-            if not cand.startswith("{") and '"action"' in cand and '"symbol"' in cand:
-                fixed = "{" + cand
-                if not cand.rstrip().endswith("}"):
-                    fixed += "}"
-                attempts.insert(0, fixed)
-            for t in attempts:
-                try:
-                    payload = _json.loads(t)
-                    _dbg("[PARSE] recovered JSON from tolerant parser")
-                    break
-                except Exception:
-                    continue
-    if payload is None:
-        _dbg("bad_json")
+        _dbg("[SIGDBG] bad_json")
         return jsonify({"ok": True, "skip": "bad_json"}), 200
+    
+    action = payload.get("action", "").lower().strip()
+    tv_symbol = str(payload.get("symbol") or "").upper().replace("/", "")
+    tf_raw = payload.get("tf") or ""
+    tf = normalize_tf(tf_raw)
+    
+    try:
+        price = float(payload.get("price") or 0.0)
+    except ValueError:
+        _dbg(f"[WARN] Invalid price '{payload.get('price')}'; fallback to current")
+        try:
+            price = float(mexc.fetch_ticker('XRP/USDT')['last'])  # Live prijs fetch als fallback
+        except Exception as e:
+            _dbg(f"[WARN] Fetch ticker error: {e}; use 0")
+            price = 0.0
+    
+    if action not in ["buy", "sell"]:
+        _dbg(f"[SKIP] Invalid action '{action}'")
+        return jsonify({"ok": True, "skipped": "invalid_action"}), 200
+    
+    # ... (je bestaande code voor sym_to_ccxt, TF allowlist, etc. – plak die hieronder)
+    
+    # Timeframe allowlist per symbol from ENV
+    try:
+        allowlist_tfs = allowed_tfs_for(tv_symbol)
+        atfs = allowed_tfs_for(tv_symbol)
+        if tf not in atfs:
+            _dbg(f"[TF FILTER] skip {tv_symbol} tf={tf} not allowed ({', '.join(sorted(atfs))})")
+            return jsonify({"ok": True, "skip": f"tf not allowed"}), 200
+    except Exception as e:
+        _dbg(f"[TF FILTER] warn: {e}")
+    
+    # ... (rest van je functie: sym_to_ccxt, buy/sell logic, etc.)
+    
+    return jsonify({"ok": True}), 200  # Je originele return
 
     action = str(payload.get("action") or "").lower().strip()
     tv_symbol = str(payload.get("symbol") or payload.get("SYMBOL") or "").upper().replace(" ", "")
     source = str(payload.get("source") or "")
     raw_tf = str(payload.get("tf") or payload.get("timeframe") or "")
     tf = normalize_tf(raw_tf)
+try:
     price = float(payload.get("price") or 0.0)
-    bartime = str(payload.get("bartime") or payload.get("bar_time") or payload.get("bar") or "")
+except ValueError:
+    _dbg(f"[WARN] Invalid price '{payload.get('price')}'; fallback to 0")
+    price = 0.0  # Of: price = float(mexc.fetch_ticker('XRP/USDT')['last']) voor current price
 
-    if not action or not tv_symbol:
-        return jsonify({"ok": True, "skip": "missing action/symbol"}), 200
+# ... (je bestaande code voor action/symbol check)
+
+action = payload.get("action", "").lower()
+if action not in ["buy", "sell"]:
+    _dbg(f"[SKIP] Invalid action '{action}'")
+    return jsonify({"ok": True, "skipped": "invalid_action"}), 200
+
+# ... (rest van je webhook-functie, zoals sym_to_ccxt)
 
     symbol = tv_to_ccxt(tv_symbol)
 
