@@ -17,7 +17,7 @@ import os
 import time
 import json
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from threading import Lock, Thread
 from typing import Dict, Any, Tuple, List
@@ -456,7 +456,7 @@ def _ensure_spend_buy(symbol: str, price: float, source: str = "", tf: str = "")
     st["last_action_ts"] = time.time()
     
     try:
-        budget = BUDGET_USDT[symbol] * (1 - SPAR EN_SPLIT_PCT / 100 if SPAR EN_ENABLED else 1)
+        budget = BUDGET_USDT[symbol] * (1 - SPAREN_SPLIT_PCT / 100 if SPAREN_ENABLED else 1)
         amount_usd = min(budget, st.get("free_usd", budget))
         qty = amount_usd / price
         
