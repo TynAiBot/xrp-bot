@@ -60,6 +60,9 @@ ATR_SL_MULT = float(os.getenv("ATR_SL_MULT","1.5"))
 NOTIFY_FILLS = int(os.getenv("NOTIFY_FILLS","1"))
 NOTIFY_TP_SL = int(os.getenv("NOTIFY_TP_SL","1"))
 
+# NEW: start trades-lookback (0 = start vanaf nu)
+TRADES_LOOKBACK_S = int(os.getenv("TRADES_LOOKBACK_S", "0"))
+
 # Telegram & web
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN","")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","")
@@ -108,21 +111,17 @@ def set_deriv_modes(ex):
         logging.info("Derivatives setup via API overgeslagen (USE_PERP=0 of DERIV_SETUP=0).")
         return
     try:
-        # Niet alle acties worden door ccxt/MEXC ondersteund — we vangen netjes af.
         try:
             ex.set_margin_mode(MARGIN_MODE, SYMBOL)
             logging.info(f"Margin mode='{MARGIN_MODE}' ingesteld.")
         except Exception as e:
             logging.info(f"set_margin_mode: {e}")
-
         try:
-            # MEXC wil soms extra params (openType/positionType). Simpele best-effort.
             params = {"openType": 1 if MARGIN_MODE=="isolated" else 2}
             ex.set_leverage(LEVERAGE, SYMBOL, params=params)
             logging.info(f"Leverage={LEVERAGE} ingesteld.")
         except Exception as e:
             logging.info(f"set_leverage: {e}")
-
         try:
             ex.set_position_mode(bool(HEDGE_MODE), SYMBOL)
             logging.info(f"Hedge mode={'ON' if HEDGE_MODE else 'OFF'}.")
@@ -221,7 +220,6 @@ def time_matches(hhmm):
 # === TP/SL helpers ===
 def compute_tp_price(mode, entry, spacing, center, side):
     if mode=="midline":
-        # tp richting center; fallback 1×spacing als center ongunstig is
         target = center
         if side=="long" and target<=entry: target = entry + spacing
         if side=="short" and target>=entry: target = entry - spacing
@@ -241,6 +239,9 @@ def compute_sl_price(entry, atr, side):
 def bot_thread():
     global last_trade_ms
     ex=ccxt_client(); set_deriv_modes(ex)
+
+    # start vanaf NU (minus optionele lookback) om oude fills te negeren
+    last_trade_ms = int(time.time() * 1000) - TRADES_LOOKBACK_S * 1000
 
     state=load_state()
     last_atr, last_mode, last_center = state.get("last_atr"), state.get("last_mode"), state.get("last_center")
@@ -284,10 +285,10 @@ def bot_thread():
                     for px in long_buys:
                         if not can_add(total_l, BASE_ORDER_USDT, MAX_NOTIONAL_LONG, total_g, MAX_OPEN_NOTIONAL): break
                         try:
-                            place_limit(ex,"buy",px,BASE_ORDER_USDT,reduce_only=False,pos_side="long" if HEDGE_MODE else None)
+                            place_limit(ex,"buy",px,BASE_ORDER_USDT,reduce_only=False,pos_side="long" if (USE_PERP and HEDGE_MODE) else None)
                             total_l+=BASE_ORDER_USDT; total_g+=BASE_ORDER_USDT; placed+=1
                         except Exception as e: logging.warning(f"long grid fail @{px}: {e}")
-                if ENABLE_SHORT:
+                if USE_PERP and ENABLE_SHORT:
                     for px in short_sells:
                         if not can_add(total_s, BASE_ORDER_USDT, MAX_NOTIONAL_SHORT, total_g, MAX_OPEN_NOTIONAL): break
                         try:
@@ -317,7 +318,14 @@ def bot_thread():
                 side = tr.get("side")  # 'buy'/'sell'
                 info = tr.get("info", {})
                 pos_side = (info.get("positionSide") or info.get("posSide") or "").upper()
-                my_pos_side = "LONG" if (pos_side=="LONG" or (HEDGE_MODE and side=="buy")) else ("SHORT" if (pos_side=="SHORT" or (HEDGE_MODE and side=="sell")) else None)
+
+                if USE_PERP:
+                    my_pos_side = "LONG" if (pos_side=="LONG" or (HEDGE_MODE and side=="buy")) else ("SHORT" if (pos_side=="SHORT" or (HEDGE_MODE and side=="sell")) else None)
+                else:
+                    # SPOT: alleen BUY opent (long). SELL is TP/exit -> sla over als nieuwe fill.
+                    if side == "sell":
+                        continue
+                    my_pos_side = "LONG"
 
                 price = float(tr.get("price") or tr.get("info",{}).get("price") or 0)
                 amount = float(tr.get("amount") or tr.get("contracts") or 0)
@@ -326,23 +334,27 @@ def bot_thread():
                 fid = tr.get("id") or f"{ts}-{side}-{price}"
                 if fid in fills: continue
 
-                fills[fid] = {"side":"long" if my_pos_side=="LONG" else ("short" if my_pos_side=="SHORT" else ("long" if side=="buy" else "short")),
+                fills[fid] = {"side":"long" if my_pos_side=="LONG" else "short",
                               "entry_price": price, "qty": amount, "tp": None, "sl": None, "active": True}
                 if NOTIFY_FILLS:
                     send_telegram(f"✅ Fill: {fills[fid]['side'].upper()} {amount:g} @ {price:.6f}")
 
                 spacing = last_spacing or (last_atr*ATR_MULT if last_atr else atr*ATR_MULT)
                 tp_price = compute_tp_price(TP_MODE, price, spacing, last_center if last_center is not None else center, fills[fid]["side"])
-                if REDUCE_ONLY_TP:
-                    try:
-                        side_out = "sell" if fills[fid]["side"]=="long" else "buy"
-                        pos_tag = "long" if fills[fid]["side"]=="long" else "short"
-                        # notional = price*amount -> gebruik RO limit met amount (reduceOnly=true)
-                        o = place_limit(ex, side_out, tp_price, usdt=price*amount, reduce_only=True, pos_side=pos_tag if HEDGE_MODE else None)
-                        fills[fid]["tp"] = {"id": o.get("id","TP"), "price": tp_price}
-                        if NOTIFY_TP_SL: send_telegram(f"🎯 TP geplaatst: {side_out.upper()} RO @ {tp_price:.6f} (entry {price:.6f})")
-                    except Exception as e:
-                        logging.warning(f"TP place fail: {e}")
+
+                # TP plaatsen (spot: REDUCE_ONLY_TP=0 ⇒ gewone limit sell; perps: reduceOnly)
+                try:
+                    side_out = "sell" if fills[fid]["side"]=="long" else "buy"
+                    pos_tag = "long" if fills[fid]["side"]=="long" else "short"
+                    o = place_limit(
+                        ex, side_out, tp_price, usdt=price*amount,
+                        reduce_only=bool(REDUCE_ONLY_TP) if USE_PERP else False,
+                        pos_side=pos_tag if (USE_PERP and HEDGE_MODE) else None
+                    )
+                    fills[fid]["tp"] = {"id": o.get("id","TP"), "price": tp_price}
+                    if NOTIFY_TP_SL: send_telegram(f"🎯 TP geplaatst: {side_out.upper()} {'RO ' if (USE_PERP and REDUCE_ONLY_TP) else ''}@ {tp_price:.6f} (entry {price:.6f})")
+                except Exception as e:
+                    logging.warning(f"TP place fail: {e}")
 
                 sl_price = compute_sl_price(price, last_atr if last_atr is not None else atr, fills[fid]["side"])
                 fills[fid]["sl"] = {"price": sl_price}
@@ -358,7 +370,9 @@ def bot_thread():
                 if tp and ((side=="long" and close>=tp["price"]) or (side=="short" and close<=tp["price"])):
                     try:
                         side_out = "sell" if side=="long" else "buy"
-                        place_market_reduce_only(ex, side_out, amount_base=qty, pos_side=side)
+                        if USE_PERP:
+                            place_market_reduce_only(ex, side_out, amount_base=qty, pos_side=side)
+                        # Spot: laat de exchange-TP het werk doen; watchdog is vooral backup
                         f["active"]=False; to_deactivate.append(fid)
                         if NOTIFY_TP_SL: send_telegram(f"🏁 TP uitgevoerd (soft): {side_out.upper()} {qty:g} @~{close:.6f} (tp {tp['price']:.6f})")
                         continue
@@ -369,7 +383,12 @@ def bot_thread():
                 if sl and ((side=="long" and close<=sl["price"]) or (side=="short" and close>=sl["price"])):
                     try:
                         side_out = "sell" if side=="long" else "buy"
-                        place_market_reduce_only(ex, side_out, amount_base=qty, pos_side=side)
+                        if USE_PERP:
+                            place_market_reduce_only(ex, side_out, amount_base=qty, pos_side=side)
+                        else:
+                            # Spot: sluit met markt-sell dezelfde hoeveelheid
+                            if not DRY_RUN:
+                                ex.create_order(SYMBOL, type="market", side="sell", amount=qty)
                         f["active"]=False; to_deactivate.append(fid)
                         if NOTIFY_TP_SL: send_telegram(f"🛑 SL uitgevoerd (soft): {side_out.upper()} {qty:g} @~{close:.6f} (sl {sl['price']:.6f})")
                     except Exception as e:
