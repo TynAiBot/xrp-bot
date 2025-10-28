@@ -16,23 +16,20 @@ SYMBOL  = os.getenv("SYMBOL", "XRP/USDT")
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 HTF = os.getenv("HTF", "1h")
 
-USE_PERP = int(os.getenv("USE_PERP", "1"))
+USE_PERP = int(os.getenv("USE_PERP", "0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "3"))
-MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")    # isolated|cross
-HEDGE_MODE = int(os.getenv("HEDGE_MODE", "1"))
-DERIV_SETUP = int(os.getenv("DERIV_SETUP", "1"))       # 0 = sla API-setup over (UI gebruiken)
+MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")
+HEDGE_MODE = int(os.getenv("HEDGE_MODE", "0"))
+DERIV_SETUP = int(os.getenv("DERIV_SETUP", "0"))
 
 ENABLE_LONG  = int(os.getenv("ENABLE_LONG", "1"))
-ENABLE_SHORT = int(os.getenv("ENABLE_SHORT", "1"))
+ENABLE_SHORT = int(os.getenv("ENABLE_SHORT", "0"))
 
 GRID_LAYERS = int(os.getenv("GRID_LAYERS", "6"))
 ATR_LEN = int(os.getenv("ATR_LEN", "14"))
 ATR_MULT = float(os.getenv("ATR_MULT", "0.9"))
 ADX_LEN = int(os.getenv("ADX_LEN", "14"))
 ADX_RANGE_TH = float(os.getenv("ADX_RANGE_TH", "20"))
-
-RSI_LEN, RSI_OB, RSI_OS = int(os.getenv("RSI_LEN", "14")), int(os.getenv("RSI_OB","70")), int(os.getenv("RSI_OS","30"))
-STOCH_LEN, STOCH_K, STOCH_D = int(os.getenv("STOCH_LEN","14")), int(os.getenv("STOCH_K","3")), int(os.getenv("STOCH_D","3"))
 DONCHIAN_LEN = int(os.getenv("DONCHIAN_LEN","100"))
 
 BASE_ORDER_USDT   = float(os.getenv("BASE_ORDER_USDT", "20"))
@@ -40,8 +37,8 @@ MAX_OPEN_NOTIONAL = float(os.getenv("MAX_OPEN_NOTIONAL", "1000"))
 MAX_NOTIONAL_LONG = float(os.getenv("MAX_NOTIONAL_LONG","600"))
 MAX_NOTIONAL_SHORT= float(os.getenv("MAX_NOTIONAL_SHORT","600"))
 
-POST_ONLY = int(os.getenv("POST_ONLY","1"))
-REDUCE_ONLY_TP = int(os.getenv("REDUCE_ONLY_TP","1"))
+POST_ONLY = int(os.getenv("POST_ONLY","0"))
+REDUCE_ONLY_TP = int(os.getenv("REDUCE_ONLY_TP","0"))
 
 POLL_SEC = int(os.getenv("POLL_SEC","15"))
 REBUILD_ATR_DELTA = float(os.getenv("REBUILD_ATR_DELTA","0.2"))
@@ -52,16 +49,21 @@ STATE_FILE = os.getenv("STATE_FILE","grid_state.json")
 MEXC_RECVWINDOW_MS = int(os.getenv("MEXC_RECVWINDOW_MS", "10000"))
 CCXT_TIMEOUT_MS = int(os.getenv("CCXT_TIMEOUT_MS","7000"))
 
-# --- TP/SL & fills ---
-TP_MODE = os.getenv("TP_MODE","midline")       # midline | spacing | pct
+# TP/SL & fills
+TP_MODE = os.getenv("TP_MODE","spacing")       # midline | spacing | pct
 TP_SPACING_MULT = float(os.getenv("TP_SPACING_MULT","1.0"))
-TP_PCT = float(os.getenv("TP_PCT","0.004"))    # 0.004=0.4% (voor TP_MODE=pct)
-ATR_SL_MULT = float(os.getenv("ATR_SL_MULT","1.5"))
+TP_PCT = float(os.getenv("TP_PCT","0.004"))
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT","2.0"))
 NOTIFY_FILLS = int(os.getenv("NOTIFY_FILLS","1"))
 NOTIFY_TP_SL = int(os.getenv("NOTIFY_TP_SL","1"))
 
-# NEW: start trades-lookback (0 = start vanaf nu)
+# Trades fetch window (live fills)
 TRADES_LOOKBACK_S = int(os.getenv("TRADES_LOOKBACK_S", "0"))
+
+# Paper trading
+PAPER_MODE = int(os.getenv("PAPER_MODE","1"))
+PAPER_USDT_START = float(os.getenv("PAPER_USDT_START","2000"))
+PAPER_FEE_PCT = float(os.getenv("PAPER_FEE_PCT","0.0006"))
 
 # Telegram & web
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN","")
@@ -79,7 +81,17 @@ runtime = {"mode":None,"center":None,"atr":None,"adx":None,"spacing":None,
            "don_low":None,"don_high":None,"long_notional":0.0,"short_notional":0.0,
            "global_notional":0.0,"last_report":None}
 last_trade_ms = 0
-fills = {}  # fill_id -> {"side":"long/short","entry_price":..., "qty":..., "tp":..., "sl":..., "active":True}
+fills = {}  # real/perp or spot fills (dict)
+
+# Paper state
+paper = {
+    "enabled": bool(PAPER_MODE and DRY_RUN),
+    "usdt": PAPER_USDT_START,
+    "xrp": 0.0,
+    "realized_pnl_usdt": 0.0,
+    "open_orders": [],   # list of dicts: {id,type,side,price,qty,linked_tp,created_at,status}
+    "closed_trades": []  # {side, entry, exit, qty, pnl_usdt, ts_entry, ts_exit}
+}
 
 # ===== Utils =====
 def now_utc(): return datetime.now(timezone.utc)
@@ -142,13 +154,9 @@ def compute_indicators(df_ltf: pd.DataFrame, df_htf: pd.DataFrame):
     d["adx"]=adx[f"ADX_{ADX_LEN}"]
     d["ema200"]=ta.ema(d["close"],length=200)
 
-    # Donchian via pandas (pandas_ta 0.4.x heeft geen highest/lowest helpers)
     h = df_htf.copy()
-    don_high_series = h["high"].rolling(window=DONCHIAN_LEN, min_periods=1).max()
-    don_low_series  = h["low"].rolling(window=DONCHIAN_LEN, min_periods=1).min()
-    don_high = float(don_high_series.iloc[-1])
-    don_low  = float(don_low_series.iloc[-1])
-
+    don_high = float(h["high"].rolling(window=DONCHIAN_LEN, min_periods=1).max().iloc[-1])
+    don_low  = float(h["low"] .rolling(window=DONCHIAN_LEN, min_periods=1).min().iloc[-1])
     return d, don_low, don_high
 
 def decide_regime(adx_val): return "range" if adx_val < ADX_RANGE_TH else "trend"
@@ -161,6 +169,22 @@ def build_grids(center, atr_val, mode):
         long_buys.append(round(center - i*spacing,8))
         short_sells.append(round(center + i*spacing,8))
     return spacing, long_buys, short_sells
+
+def compute_tp_price(mode, entry, spacing, center, side):
+    if mode=="midline":
+        target = center
+        if side=="long" and target<=entry: target = entry + spacing
+        if side=="short" and target>=entry: target = entry - spacing
+        return target
+    elif mode=="spacing":
+        return entry + (spacing*TP_SPACING_MULT if side=="long" else -spacing*TP_SPACING_MULT)
+    elif mode=="pct":
+        delta = entry*TP_PCT
+        return entry + (delta if side=="long" else -delta)
+    return entry + (spacing if side=="long" else -spacing)
+
+def compute_sl_price(entry, atr, side):
+    return entry - ATR_SL_MULT*atr if side=="long" else entry + ATR_SL_MULT*atr
 
 def can_add(side_total, add, side_cap, g_total, g_cap):
     return (side_total+add)<=side_cap and (g_total+add)<=g_cap
@@ -201,14 +225,14 @@ def daily_report(ex):
         usdt_total=float((bal.get("total") or {}).get("USDT",usdt_free+usdt_used))
     eur=usdt_total*USD_TO_EUR
     return (
-        "<b>Dagrapport — Hedge Grid Bot</b>\n"
+        "<b>Dagrapport — Grid Bot</b>\n"
         f"Symbool: <b>{SYMBOL}</b>\n"
         f"Mode: <b>{runtime.get('mode')}</b> | ADX≈{(runtime.get('adx') or 0):.1f} | ATR≈{(runtime.get('atr') or 0):.6f}\n"
         f"Center≈{(runtime.get('center') or 0):.6f} | Spacing≈{(runtime.get('spacing') or 0):.6f}\n"
         f"HTF: [{(runtime.get('don_low') or 0):.6f} .. {(runtime.get('don_high') or 0):.6f}]\n\n"
-        f"USDT: total≈<b>{usdt_total:.2f}</b> (free {usdt_free:.2f} / used {usdt_used:.2f}) ≈ €{eur:.2f}\n"
-        f"Exposure: LONG≈{runtime['long_notional']:.2f} | SHORT≈{runtime['short_notional']:.2f} | TOTAAL≈{runtime['global_notional']:.2f} USDT\n"
-        f"Tijd: {fmt_ts(now_utc())}"
+        f"(Exchange) USDT≈<b>{usdt_total:.2f}</b> (free {usdt_free:.2f} / used {usdt_used:.2f}) ≈ €{eur:.2f}\n"
+        + (f"(Paper) USDT≈{paper['usdt']:.2f} | XRP≈{paper['xrp']:.4f} | Realized PnL≈{paper['realized_pnl_usdt']:.2f}\n" if paper["enabled"] else "")
+        + f"Tijd: {fmt_ts(now_utc())}"
     )
 
 def time_matches(hhmm):
@@ -217,50 +241,69 @@ def time_matches(hhmm):
     loc=datetime.now().astimezone()
     return loc.hour==hh and loc.minute==mm
 
-# === TP/SL helpers ===
-def compute_tp_price(mode, entry, spacing, center, side):
-    if mode=="midline":
-        target = center
-        if side=="long" and target<=entry: target = entry + spacing
-        if side=="short" and target>=entry: target = entry - spacing
-        return target
-    elif mode=="spacing":
-        return entry + (spacing*TP_SPACING_MULT if side=="long" else -spacing*TP_SPACING_MULT)
-    elif mode=="pct":
-        delta = entry*TP_PCT
-        return entry + (delta if side=="long" else -delta)
-    else:
-        return entry + (spacing if side=="long" else -spacing)
+# ===== Paper helpers =====
+def paper_reset():
+    paper.update({"usdt": PAPER_USDT_START, "xrp": 0.0, "realized_pnl_usdt": 0.0, "open_orders": [], "closed_trades": []})
 
-def compute_sl_price(entry, atr, side):
-    return entry - ATR_SL_MULT*atr if side=="long" else entry + ATR_SL_MULT*atr
+def paper_place_buy(price, now_ts):
+    usdt = BASE_ORDER_USDT
+    if paper["usdt"] < usdt: return False
+    qty = round(usdt / max(price,1e-12), 6)
+    fee = usdt * PAPER_FEE_PCT
+    paper["usdt"] -= (usdt + fee)
+    paper["xrp"]  += qty
+    oid = f"PBUY-{now_ts}-{price}"
+    paper["open_orders"].append({"id": oid, "type":"tp", "side":"sell", "price": None, "qty": qty, "status":"open"})
+    if NOTIFY_FILLS: send_telegram(f"🧪 PAPER BUY {qty:g} @ {price:.6f} (fee {fee:.4f} USDT)")
+    return oid, qty
+
+def paper_set_tp(entry_price, spacing, center, side, last_atr):
+    tp = compute_tp_price(TP_MODE, entry_price, spacing, center, side)
+    # laatste open tp order krijgt prijs
+    for o in reversed(paper["open_orders"]):
+        if o["type"]=="tp" and o["price"] is None:
+            o["price"]=tp
+            if NOTIFY_TP_SL: send_telegram(f"🧪 PAPER TP set SELL @ {tp:.6f}")
+            break
+
+def paper_check_exec(close, now_ts):
+    """execute TP sells when close >= tp price"""
+    executed=[]
+    for o in list(paper["open_orders"]):
+        if o["status"]!="open" or o["type"]!="tp" or o["price"] is None: continue
+        if close >= o["price"]:
+            qty=o["qty"]; price=o["price"]
+            proceeds = qty * price
+            fee = proceeds * PAPER_FEE_PCT
+            paper["usdt"] += (proceeds - fee)
+            paper["xrp"]  -= qty
+            o["status"]="filled"; executed.append(o["id"])
+            paper["realized_pnl_usdt"] += (proceeds - fee) - (qty * price)  # approx 0; PnL zou op entry vs exit moeten, maar we boeken netto in usdt
+            if NOTIFY_TP_SL: send_telegram(f"🧪 PAPER SELL {qty:g} @ {price:.6f} (fee {fee:.4f} USDT)")
+    # opruimen
+    paper["open_orders"] = [o for o in paper["open_orders"] if o["status"]=="open"]
 
 # ===== Bot thread =====
 def bot_thread():
     global last_trade_ms
     ex=ccxt_client(); set_deriv_modes(ex)
 
-    # start vanaf NU (minus optionele lookback) om oude fills te negeren
     last_trade_ms = int(time.time() * 1000) - TRADES_LOOKBACK_S * 1000
-
     state=load_state()
     last_atr, last_mode, last_center = state.get("last_atr"), state.get("last_mode"), state.get("last_center")
     grid_live = state.get("grid_live", False)
     last_spacing = state.get("last_spacing")
 
     total_g=total_l=total_s=0.0
+    if paper["enabled"]: paper_reset()
 
-    send_telegram(f"🔧 Bot gestart — {SYMBOL} | perp={USE_PERP} lev={LEVERAGE} hedge={HEDGE_MODE} iso={MARGIN_MODE=='isolated'} | DRY_RUN={DRY_RUN}")
+    send_telegram(f"🔧 Bot gestart — {SYMBOL} | perp={USE_PERP} lev={LEVERAGE} hedge={HEDGE_MODE} iso={MARGIN_MODE=='isolated'} | DRY_RUN={DRY_RUN} | PAPER={paper['enabled']}")
 
     while not _stop.is_set():
         try:
             df_ltf, df_htf = to_df(fetch_ohlcv(ex,TIMEFRAME)), to_df(fetch_ohlcv(ex,HTF))
             d, don_low, don_high = compute_indicators(df_ltf, df_htf)
-
-            close=float(d["close"].iloc[-1])
-            atr=float(d["atr"].iloc[-1])
-            adx=float(d["adx"].iloc[-1])
-            ema200=float(d["ema200"].iloc[-1])
+            close=float(d["close"].iloc[-1]); atr=float(d["atr"].iloc[-1]); adx=float(d["adx"].iloc[-1]); ema200=float(d["ema200"].iloc[-1])
 
             mode=decide_regime(adx)
             center=min(max(ema200,don_low),don_high)
@@ -272,130 +315,93 @@ def bot_thread():
                 if abs(atr-last_atr)/max(1e-8,last_atr)>REBUILD_ATR_DELTA: need_rebuild=True
                 if mode!=last_mode: need_rebuild=True
                 if close<lower_break or close>upper_break:
-                    send_telegram(f"⚠️ Breakout: close {close:.6f} buiten [{lower_break:.6f}, {upper_break:.6f}] — flatten & rebuild")
-                    try: cancel_all(ex)
-                    except: pass
+                    send_telegram(f"⚠️ Breakout: close {close:.6f} buiten [{lower_break:.6f}, {upper_break:.6f}] — rebuild")
                     need_rebuild=True
 
             if need_rebuild:
-                cancel_all(ex)
-                spacing,long_buys,short_sells = build_grids(center,atr,mode)
-                placed=0
-                if ENABLE_LONG:
-                    for px in long_buys:
-                        if not can_add(total_l, BASE_ORDER_USDT, MAX_NOTIONAL_LONG, total_g, MAX_OPEN_NOTIONAL): break
-                        try:
-                            place_limit(ex,"buy",px,BASE_ORDER_USDT,reduce_only=False,pos_side="long" if (USE_PERP and HEDGE_MODE) else None)
-                            total_l+=BASE_ORDER_USDT; total_g+=BASE_ORDER_USDT; placed+=1
-                        except Exception as e: logging.warning(f"long grid fail @{px}: {e}")
-                if USE_PERP and ENABLE_SHORT:
-                    for px in short_sells:
-                        if not can_add(total_s, BASE_ORDER_USDT, MAX_NOTIONAL_SHORT, total_g, MAX_OPEN_NOTIONAL): break
-                        try:
-                            place_limit(ex,"sell",px,BASE_ORDER_USDT,reduce_only=False,pos_side="short" if HEDGE_MODE else None)
-                            total_s+=BASE_ORDER_USDT; total_g+=BASE_ORDER_USDT; placed+=1
-                        except Exception as e: logging.warning(f"short grid fail @{px}: {e}")
-
+                last_spacing,long_buys,short_sells = build_grids(center,atr,mode)
                 grid_live=True; last_atr, last_mode, last_center = atr, mode, center
-                last_spacing = spacing
                 save_state({"last_atr":last_atr,"last_mode":last_mode,"last_center":last_center,"grid_live":grid_live,
-                            "last_spacing":spacing,"updated_at":now_utc().isoformat(),
+                            "last_spacing":last_spacing,"updated_at":now_utc().isoformat(),
                             "last_levels":{"long_buys":long_buys,"short_sells":short_sells}})
-                send_telegram(f"🔁 Rebuild grid — Mode <b>{mode}</b> | ADX≈{adx:.1f} | ATR≈{atr:.6f}\nCenter≈{center:.6f} | Spacing≈{spacing:.6f}\nHTF: [{don_low:.6f} .. {don_high:.6f}]\nOrders: <b>{placed}</b>")
+                send_telegram(f"🔁 Rebuild grid — Mode <b>{mode}</b> | ADX≈{adx:.1f} | ATR≈{atr:.6f}\nCenter≈{center:.6f} | Spacing≈{last_spacing:.6f}\nHTF: [{don_low:.6f} .. {don_high:.6f}]")
 
-            # === Fills detectie ===
-            try:
-                trades = ex.fetch_my_trades(SYMBOL, since=last_trade_ms or None, limit=100)
-            except Exception as e:
-                trades=[]; logging.debug(f"fetch_my_trades: {e}")
+            # === PAPER SIM: trigger buys op gridbreuk (spot long-only) ===
+            if paper["enabled"] and ENABLE_LONG:
+                # We bouwen actuele long-buys opnieuw om richting te weten
+                spacing,long_buys,_ = build_grids(center,atr,mode)
+                # Voor elk buy-level dat de close kruist -> simulate BUY + set TP
+                for px in long_buys:
+                    # simpel: als close <= level en we hebben genoeg USDT, koop
+                    if close <= px and paper["usdt"] >= BASE_ORDER_USDT:
+                        oid_qty = paper_place_buy(px, int(time.time()*1000))
+                        if oid_qty:
+                            _, qty = oid_qty
+                            # bepaal TP en zet in open_orders
+                            tp_price = compute_tp_price(TP_MODE, px, spacing, center, "long")
+                            paper["open_orders"].append({"id": f"PTP-{int(time.time()*1000)}-{tp_price}",
+                                                         "type":"tp","side":"sell","price":tp_price,"qty":qty,
+                                                         "status":"open"})
+                            if NOTIFY_TP_SL: send_telegram(f"🧪 PAPER TP geplaatst SELL @ {tp_price:.6f}")
 
-            new_max_ms = last_trade_ms
-            for tr in trades or []:
-                ts = int(tr.get("timestamp") or 0)
-                if ts and ts <= last_trade_ms: continue
-                new_max_ms = max(new_max_ms, ts or 0)
+                # Check of TP's raken
+                paper_check_exec(close, int(time.time()*1000))
 
-                side = tr.get("side")  # 'buy'/'sell'
-                info = tr.get("info", {})
-                pos_side = (info.get("positionSide") or info.get("posSide") or "").upper()
-
-                if USE_PERP:
-                    my_pos_side = "LONG" if (pos_side=="LONG" or (HEDGE_MODE and side=="buy")) else ("SHORT" if (pos_side=="SHORT" or (HEDGE_MODE and side=="sell")) else None)
-                else:
-                    # SPOT: alleen BUY opent (long). SELL is TP/exit -> sla over als nieuwe fill.
-                    if side == "sell":
-                        continue
-                    my_pos_side = "LONG"
-
-                price = float(tr.get("price") or tr.get("info",{}).get("price") or 0)
-                amount = float(tr.get("amount") or tr.get("contracts") or 0)
-                if amount<=0 or price<=0: continue
-
-                fid = tr.get("id") or f"{ts}-{side}-{price}"
-                if fid in fills: continue
-
-                fills[fid] = {"side":"long" if my_pos_side=="LONG" else "short",
-                              "entry_price": price, "qty": amount, "tp": None, "sl": None, "active": True}
-                if NOTIFY_FILLS:
-                    send_telegram(f"✅ Fill: {fills[fid]['side'].upper()} {amount:g} @ {price:.6f}")
-
-                spacing = last_spacing or (last_atr*ATR_MULT if last_atr else atr*ATR_MULT)
-                tp_price = compute_tp_price(TP_MODE, price, spacing, last_center if last_center is not None else center, fills[fid]["side"])
-
-                # TP plaatsen (spot: REDUCE_ONLY_TP=0 ⇒ gewone limit sell; perps: reduceOnly)
+            # === REAL TRADES FETCH (alleen als we niet in pure paper willen leunen) ===
+            if not paper["enabled"]:
                 try:
-                    side_out = "sell" if fills[fid]["side"]=="long" else "buy"
-                    pos_tag = "long" if fills[fid]["side"]=="long" else "short"
-                    o = place_limit(
-                        ex, side_out, tp_price, usdt=price*amount,
-                        reduce_only=bool(REDUCE_ONLY_TP) if USE_PERP else False,
-                        pos_side=pos_tag if (USE_PERP and HEDGE_MODE) else None
-                    )
-                    fills[fid]["tp"] = {"id": o.get("id","TP"), "price": tp_price}
-                    if NOTIFY_TP_SL: send_telegram(f"🎯 TP geplaatst: {side_out.upper()} {'RO ' if (USE_PERP and REDUCE_ONLY_TP) else ''}@ {tp_price:.6f} (entry {price:.6f})")
+                    trades = ex.fetch_my_trades(SYMBOL, since=last_trade_ms or None, limit=100)
                 except Exception as e:
-                    logging.warning(f"TP place fail: {e}")
+                    trades=[]; logging.debug(f"fetch_my_trades: {e}")
 
-                sl_price = compute_sl_price(price, last_atr if last_atr is not None else atr, fills[fid]["side"])
-                fills[fid]["sl"] = {"price": sl_price}
+                new_max_ms = last_trade_ms
+                for tr in trades or []:
+                    ts = int(tr.get("timestamp") or 0)
+                    if ts and ts <= last_trade_ms: continue
+                    new_max_ms = max(new_max_ms, ts or 0)
 
-            if new_max_ms>last_trade_ms: last_trade_ms = new_max_ms
+                    side = tr.get("side")
+                    info = tr.get("info", {})
+                    pos_side = (info.get("positionSide") or info.get("posSide") or "").upper()
 
-            # === SL/TP watchdog (soft) ===
-            to_deactivate=[]
-            for fid, f in list(fills.items()):
-                if not f.get("active"): continue
-                side=f["side"]; qty=f["qty"]; entry=f["entry_price"]
-                tp=f.get("tp")
-                if tp and ((side=="long" and close>=tp["price"]) or (side=="short" and close<=tp["price"])):
+                    if USE_PERP:
+                        my_pos_side = "LONG" if (pos_side=="LONG" or (HEDGE_MODE and side=="buy")) else ("SHORT" if (pos_side=="SHORT" or (HEDGE_MODE and side=="sell")) else None)
+                    else:
+                        if side == "sell":  # spot: sells niet als nieuwe fill tellen
+                            continue
+                        my_pos_side = "LONG"
+
+                    price = float(tr.get("price") or tr.get("info",{}).get("price") or 0)
+                    amount = float(tr.get("amount") or tr.get("contracts") or 0)
+                    if amount<=0 or price<=0: continue
+
+                    fid = tr.get("id") or f"{ts}-{side}-{price}"
+                    if fid in fills: continue
+
+                    fills[fid] = {"side":"long" if my_pos_side=="LONG" else "short",
+                                  "entry_price": price, "qty": amount, "tp": None, "sl": None, "active": True}
+                    if NOTIFY_FILLS:
+                        send_telegram(f"✅ Fill: {fills[fid]['side'].upper()} {amount:g} @ {price:.6f}")
+
+                    spacing = last_spacing or (last_atr*ATR_MULT if last_atr else atr*ATR_MULT)
+                    tp_price = compute_tp_price(TP_MODE, price, spacing, last_center if last_center is not None else center, fills[fid]["side"])
                     try:
-                        side_out = "sell" if side=="long" else "buy"
-                        if USE_PERP:
-                            place_market_reduce_only(ex, side_out, amount_base=qty, pos_side=side)
-                        # Spot: laat de exchange-TP het werk doen; watchdog is vooral backup
-                        f["active"]=False; to_deactivate.append(fid)
-                        if NOTIFY_TP_SL: send_telegram(f"🏁 TP uitgevoerd (soft): {side_out.upper()} {qty:g} @~{close:.6f} (tp {tp['price']:.6f})")
-                        continue
+                        side_out = "sell" if fills[fid]["side"]=="long" else "buy"
+                        pos_tag = "long" if fills[fid]["side"]=="long" else "short"
+                        o = place_limit(
+                            ex, side_out, tp_price, usdt=price*amount,
+                            reduce_only=bool(REDUCE_ONLY_TP) if USE_PERP else False,
+                            pos_side=pos_tag if (USE_PERP and HEDGE_MODE) else None
+                        )
+                        fills[fid]["tp"] = {"id": o.get("id","TP"), "price": tp_price}
+                        if NOTIFY_TP_SL: send_telegram(f"🎯 TP geplaatst: {side_out.upper()} {'RO ' if (USE_PERP and REDUCE_ONLY_TP) else ''}@ {tp_price:.6f} (entry {price:.6f})")
                     except Exception as e:
-                        logging.warning(f"TP soft exec fail: {e}")
+                        logging.warning(f"TP place fail: {e}")
 
-                sl=f.get("sl")
-                if sl and ((side=="long" and close<=sl["price"]) or (side=="short" and close>=sl["price"])):
-                    try:
-                        side_out = "sell" if side=="long" else "buy"
-                        if USE_PERP:
-                            place_market_reduce_only(ex, side_out, amount_base=qty, pos_side=side)
-                        else:
-                            # Spot: sluit met markt-sell dezelfde hoeveelheid
-                            if not DRY_RUN:
-                                ex.create_order(SYMBOL, type="market", side="sell", amount=qty)
-                        f["active"]=False; to_deactivate.append(fid)
-                        if NOTIFY_TP_SL: send_telegram(f"🛑 SL uitgevoerd (soft): {side_out.upper()} {qty:g} @~{close:.6f} (sl {sl['price']:.6f})")
-                    except Exception as e:
-                        logging.warning(f"SL soft exec fail: {e}")
+                    sl_price = compute_sl_price(price, last_atr if last_atr is not None else atr, fills[fid]["side"])
+                    fills[fid]["sl"] = {"price": sl_price}
 
-            for fid in to_deactivate:
-                fills.pop(fid, None)
+                if new_max_ms>last_trade_ms: last_trade_ms = new_max_ms
 
             # Runtime + dagrapport
             runtime.update({
@@ -419,9 +425,22 @@ def bot_thread():
 
 # ===== Flask =====
 @app.get("/health")
-def health(): return jsonify({"ok":True,"symbol":SYMBOL,"perp":bool(USE_PERP),"hedge":bool(HEDGE_MODE),"ts":fmt_ts(now_utc())})
+def health(): return jsonify({"ok":True,"symbol":SYMBOL,"perp":bool(USE_PERP),"hedge":bool(HEDGE_MODE),"paper":paper["enabled"],"ts":fmt_ts(now_utc())})
+
 @app.get("/state")
-def state_ep(): return jsonify({"runtime":runtime,"fills_active":len(fills)})
+def state_ep(): return jsonify({"runtime":runtime,"fills_active":len(fills),"paper_enabled":paper["enabled"]})
+
+@app.get("/paper")
+def paper_ep():
+    if not paper["enabled"]:
+        return jsonify({"paper_enabled": False, "hint": "Zet PAPER_MODE=1 en DRY_RUN=1 in .env"}), 200
+    return jsonify({
+        "paper_enabled": True,
+        "balances": {"USDT": round(paper["usdt"], 4), "XRP": round(paper["xrp"], 6)},
+        "realized_pnl_usdt": round(paper["realized_pnl_usdt"], 4),
+        "open_orders": paper["open_orders"],
+        "closed_trades_count": len(paper["closed_trades"])
+    })
 
 if __name__=="__main__":
     t=Thread(target=bot_thread,daemon=True); t.start()
