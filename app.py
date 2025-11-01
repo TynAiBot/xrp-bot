@@ -17,12 +17,12 @@ SYMBOL    = os.getenv("SYMBOL", "XRP/USDT")
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 HTF       = os.getenv("HTF", "1h")
 
-# Spot/perps flags
+# Spot/perps
 USE_PERP    = int(os.getenv("USE_PERP", "0"))
 LEVERAGE    = int(os.getenv("LEVERAGE", "3"))
 MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")  # isolated|cross
 HEDGE_MODE  = int(os.getenv("HEDGE_MODE", "0"))
-DERIV_SETUP = int(os.getenv("DERIV_SETUP", "0"))     # 0: sla API-setup over (UI gebruiken)
+DERIV_SETUP = int(os.getenv("DERIV_SETUP", "0"))     # 0: UI gebruiken, geen API-setup
 
 ENABLE_LONG  = int(os.getenv("ENABLE_LONG", "1"))
 ENABLE_SHORT = int(os.getenv("ENABLE_SHORT", "0"))
@@ -41,7 +41,7 @@ MAX_OPEN_NOTIONAL = float(os.getenv("MAX_OPEN_NOTIONAL", "1000"))
 MAX_NOTIONAL_LONG = float(os.getenv("MAX_NOTIONAL_LONG", "600"))
 MAX_NOTIONAL_SHORT= float(os.getenv("MAX_NOTIONAL_SHORT", "600"))
 
-# Order gedrag
+# Orders
 POST_ONLY      = int(os.getenv("POST_ONLY", "0"))
 REDUCE_ONLY_TP = int(os.getenv("REDUCE_ONLY_TP", "0"))
 
@@ -62,6 +62,10 @@ TP_PCT          = float(os.getenv("TP_PCT", "0.004"))
 ATR_SL_MULT     = float(os.getenv("ATR_SL_MULT", "2.0"))
 NOTIFY_FILLS    = int(os.getenv("NOTIFY_FILLS", "1"))
 NOTIFY_TP_SL    = int(os.getenv("NOTIFY_TP_SL", "1"))
+
+# Trigger op wick of close + coulance
+TP_TRIGGER_MODE = os.getenv("TP_TRIGGER_MODE", "wick").lower()  # close|wick
+PAPER_EPS_PCT   = float(os.getenv("PAPER_EPS_PCT", "0.0005"))
 
 # Trades fetch window (live fills)
 TRADES_LOOKBACK_S = int(os.getenv("TRADES_LOOKBACK_S", "0"))
@@ -96,20 +100,20 @@ runtime = {"mode":None,"center":None,"atr":None,"adx":None,"spacing":None,
            "long_notional":0.0,"short_notional":0.0,"global_notional":0.0,
            "last_report":None}
 last_trade_ms = 0
-last_paper_snapshot_min = None  # voor snapshot cadence
+last_paper_snapshot_min = None
 
-fills = {}  # real/perp of spot fills (dict)
+fills = {}  # live fills
 
-# Paper state (met handels- en spaarrekening)
+# Paper state
 paper = {
     "enabled": bool(PAPER_MODE and DRY_RUN),
     "usdt_trading": PAPER_USDT_START,
     "usdt_sparen":  0.0,
     "xrp": 0.0,
     "realized_pnl_usdt": 0.0,
-    "open_entries": [],  # FIFO entries: [{qty, entry, fee_usdt, ts}]
-    "open_orders": [],   # TP’s:       [{id, type, side, price, qty, status}]
-    "closed_trades": []  # gesloten:   [{entry, exit, qty, pnl_usdt, ts_entry, ts_exit}]
+    "open_entries": [],  # [{qty, entry, fee_usdt, ts}]
+    "open_orders": [],   # [{id, type, side, price, qty, status}]
+    "closed_trades": []  # [{entry, exit, qty, pnl_usdt, ts_entry, ts_exit}]
 }
 
 # ===== Utils =====
@@ -257,15 +261,18 @@ def _paper_fifo_take(qty_need):
         if e["qty"] <= 1e-9: paper["open_entries"].pop(0)
     return taken, qty_need - qty_left
 
-def paper_exec_tps(close, now_ts):
+def paper_exec_tps(trigger_price, now_ts):
+    """Execute TP's op basis van trigger_price (close of wick) + EPS-coulance."""
     executed = []
+    eps_up = 1.0 + PAPER_EPS_PCT
     for o in list(paper["open_orders"]):
         if o["status"] != "open" or o["type"] != "tp": continue
-        if close >= o["price"]:
+        # longs: SELL wanneer trigger >= tp*(1+eps)
+        if trigger_price >= o["price"] * eps_up:
             qty = o["qty"]; price = o["price"]
             parts, filled = _paper_fifo_take(qty)
             if filled <= 0:
-                o["status"] = "filled"; continue  # niets in voorraad, markeer klaar
+                o["status"] = "filled"; continue
             proceeds = filled * price
             fee_sell = proceeds * PAPER_FEE_PCT
             cost = sum(p["qty"] * p["entry"] for p in parts) if parts else 0.0
@@ -289,18 +296,17 @@ def paper_exec_tps(close, now_ts):
                 send_telegram(
                     f"🧪 PAPER SELL {filled:g} @ {price:.6f} (avg entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT"
                 )
-            # Sparen: deel van winst naar spaarrekening
+            # Sparen
             if SPAREN_ENABLED and pnl > SPAREN_MIN_PNL_USDT and SPAREN_SPLIT_PCT > 0:
                 to_save = pnl * (SPAREN_SPLIT_PCT / 100.0)
-                to_save = min(to_save, paper["usdt_trading"])  # safety
+                to_save = min(to_save, paper["usdt_trading"])
                 paper["usdt_trading"] -= to_save
                 paper["usdt_sparen"]  += to_save
                 if NOTIFY_TP_SL:
                     send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
-    # open_orders opschonen
     paper["open_orders"] = [o for o in paper["open_orders"] if o["status"] == "open"]
 
-# ===== Rapportage helpers =====
+# ===== Rapportage =====
 def fetch_balances_report(ex):
     rep = {}
     try:
@@ -342,7 +348,6 @@ def daily_report_text(ex):
     lines.append(f"Tijd: {fmt_ts(now_utc())}")
     return "\n".join(lines)
 
-# Paper summary/export for endpoints
 def paper_summary_dict():
     return {
         "balances": {
@@ -394,7 +399,6 @@ def bot_thread():
     global last_trade_ms, last_paper_snapshot_min
     ex = ccxt_client(); set_deriv_modes(ex)
 
-    # start vanaf nu (minus optional lookback) om oude fills te negeren
     last_trade_ms = int(time.time() * 1000) - TRADES_LOOKBACK_S * 1000
 
     state = load_state()
@@ -420,6 +424,8 @@ def bot_thread():
             d, don_low, don_high = compute_indicators(df_ltf, df_htf)
 
             close  = float(d["close"].iloc[-1])
+            hi     = float(d["high"].iloc[-1])
+            lo     = float(d["low"].iloc[-1])
             atr    = float(d["atr"].iloc[-1])
             adx    = float(d["adx"].iloc[-1])
             ema200 = float(d["ema200"].iloc[-1])
@@ -458,7 +464,10 @@ def bot_thread():
                         qty = paper_place_buy(px, int(time.time()*1000))
                         if qty:
                             paper_place_tp(qty, px, spacing, center)
-                paper_exec_tps(close, int(time.time()*1000))
+
+                # Wick- of close-based TP trigger:
+                trigger_long = hi if TP_TRIGGER_MODE == "wick" else close
+                paper_exec_tps(trigger_long, int(time.time()*1000))
 
             # === LIVE fills (alleen als PAPER uit staat) ===
             if not paper["enabled"]:
@@ -540,7 +549,7 @@ def bot_thread():
                     send_telegram(daily_report_text(ex))
                     runtime["last_report"] = stamp
 
-            # Uurlijkse (of elke N minuten) paper-snapshot naar Telegram
+            # Uurlijkse (of N-min) paper-snapshot
             if PAPER_SNAPSHOT_ENABLED and paper["enabled"]:
                 try:
                     minute = int(datetime.now().strftime("%M"))
