@@ -109,11 +109,12 @@ paper = {
     "enabled": bool(PAPER_MODE and DRY_RUN),
     "usdt_trading": PAPER_USDT_START,
     "usdt_sparen":  0.0,
-    "xrp": 0.0,
+    "xrp": 0.0,                         # long inventory
     "realized_pnl_usdt": 0.0,
-    "open_entries": [],  # [{qty, entry, fee_usdt, ts}]
-    "open_orders": [],   # [{id, type, side, price, qty, status}]
-    "closed_trades": []  # [{entry, exit, qty, pnl_usdt, ts_entry, ts_exit}]
+    "open_entries": [],                 # LONG lots [{qty, entry, fee_usdt, ts}]
+    "short_entries": [],                # SHORT lots [{qty, entry, fee_usdt, ts}]  entry=short-open price
+    "open_orders": [],                  # [{'id','type':'tp','side':'sell'|'buy','price','qty','status'}]
+    "closed_trades": []                 # [{'entry','exit','qty','pnl_usdt','ts_entry','ts_exit'}]
 }
 
 # ===== Utils =====
@@ -216,9 +217,6 @@ def compute_tp_price(mode, entry, spacing, center, side):
 def compute_sl_price(entry, atr, side):
     return entry - ATR_SL_MULT * atr if side == "long" else entry + ATR_SL_MULT * atr
 
-def can_add(side_total, add, side_cap, g_total, g_cap):
-    return (side_total + add) <= side_cap and (g_total + add) <= g_cap
-
 # ===== Paper helpers (FIFO + sparen) =====
 def paper_reset():
     paper.update({
@@ -227,6 +225,7 @@ def paper_reset():
         "xrp": 0.0,
         "realized_pnl_usdt": 0.0,
         "open_entries": [],
+        "short_entries": [],
         "open_orders": [],
         "closed_trades": []
     })
@@ -242,68 +241,113 @@ def paper_place_buy(price, now_ts):
     if NOTIFY_FILLS: send_telegram(f"🧪 PAPER BUY {qty:g} @ {price:.6f} (fee {fee_buy:.4f} USDT)")
     return qty
 
-def paper_place_tp(qty, entry_price, spacing, center):
+def paper_place_tp_long(qty, entry_price, spacing, center):
     tp = compute_tp_price(TP_MODE, entry_price, spacing, center, "long")
-    oid = f"PTP-{int(time.time()*1000)}-{tp}"
+    oid = f"PTP-L-{int(time.time()*1000)}-{tp}"
     paper["open_orders"].append({"id": oid, "type": "tp", "side": "sell", "price": tp, "qty": qty, "status": "open"})
     if NOTIFY_TP_SL: send_telegram(f"🧪 PAPER TP geplaatst SELL @ {tp:.6f}")
 
-def _paper_fifo_take(qty_need):
-    taken = []
-    qty_left = qty_need
-    while qty_left > 1e-9 and paper["open_entries"]:
-        e = paper["open_entries"][0]
+def paper_place_short(price, now_ts):
+    """Open een SHORT in paper: verkoop eerst, later terugkopen."""
+    usdt_notional = BASE_ORDER_USDT
+    qty = round(usdt_notional / max(price, 1e-12), 6)
+    fee_open = usdt_notional * PAPER_FEE_PCT
+    paper["usdt_trading"] -= fee_open   # perps-fee in USDT
+    paper["short_entries"].append({"qty": qty, "entry": price, "fee_usdt": fee_open, "ts": now_ts})
+    if NOTIFY_FILLS:
+        send_telegram(f"🧪 PAPER SHORT {qty:g} @ {price:.6f} (fee {fee_open:.4f} USDT)")
+    return qty
+
+def paper_place_tp_short(qty, entry_price, spacing, center):
+    tp = compute_tp_price(TP_MODE, entry_price, spacing, center, "short")  # lager dan entry
+    oid = f"PTP-S-{int(time.time()*1000)}-{tp}"
+    paper["open_orders"].append({"id": oid, "type": "tp", "side": "buy", "price": tp, "qty": qty, "status": "open"})
+    if NOTIFY_TP_SL:
+        send_telegram(f"🧪 PAPER TP geplaatst BUY @ {tp:.6f} (short)")
+
+def _fifo_take(lots_key, qty_need):
+    taken = []; qty_left = qty_need
+    while qty_left > 1e-9 and paper[lots_key]:
+        e = paper[lots_key][0]
         q = min(e["qty"], qty_left)
         part_fee = e["fee_usdt"] * (q / e["qty"])
         taken.append({"qty": q, "entry": e["entry"], "fee_usdt": part_fee, "ts": e["ts"]})
-        e["qty"] -= q
-        qty_left -= q
-        if e["qty"] <= 1e-9: paper["open_entries"].pop(0)
+        e["qty"] -= q; qty_left -= q
+        if e["qty"] <= 1e-9: paper[lots_key].pop(0)
     return taken, qty_need - qty_left
 
-def paper_exec_tps(trigger_price, now_ts):
-    """Execute TP's op basis van trigger_price (close of wick) + EPS-coulance."""
-    executed = []
-    eps_up = 1.0 + PAPER_EPS_PCT
+def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
+    """Execute TP's.
+       longs: side=='sell'  → hit als trigger_long >= tp*(1+eps)
+       shorts: side=='buy'  → hit als trigger_short <= tp*(1-eps)
+    """
+    eps_up  = 1.0 + PAPER_EPS_PCT
+    eps_dn  = 1.0 - PAPER_EPS_PCT
+
     for o in list(paper["open_orders"]):
         if o["status"] != "open" or o["type"] != "tp": continue
-        # longs: SELL wanneer trigger >= tp*(1+eps)
-        if trigger_price >= o["price"] * eps_up:
-            qty = o["qty"]; price = o["price"]
-            parts, filled = _paper_fifo_take(qty)
-            if filled <= 0:
-                o["status"] = "filled"; continue
-            proceeds = filled * price
-            fee_sell = proceeds * PAPER_FEE_PCT
-            cost = sum(p["qty"] * p["entry"] for p in parts) if parts else 0.0
-            total_buy_fee = sum(p["fee_usdt"] for p in parts) if parts else 0.0
-            avg_entry = (cost / max(sum(p["qty"] for p in parts), 1e-12)) if parts else 0.0
-            pnl = proceeds - fee_sell - cost - total_buy_fee
 
-            paper["usdt_trading"] += (proceeds - fee_sell)
-            paper["xrp"] -= filled
-            paper["realized_pnl_usdt"] += pnl
-            o["status"] = "filled"; executed.append(o["id"])
-            paper["closed_trades"].append({
-                "entry": round(avg_entry, 6),
-                "exit":  round(price,    6),
-                "qty":   round(filled,   6),
-                "pnl_usdt": round(pnl,   6),
-                "ts_entry": parts[0]["ts"] if parts else None,
-                "ts_exit":  now_ts
-            })
-            if NOTIFY_TP_SL:
-                send_telegram(
-                    f"🧪 PAPER SELL {filled:g} @ {price:.6f} (avg entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT"
-                )
-            # Sparen
-            if SPAREN_ENABLED and pnl > SPAREN_MIN_PNL_USDT and SPAREN_SPLIT_PCT > 0:
-                to_save = pnl * (SPAREN_SPLIT_PCT / 100.0)
-                to_save = min(to_save, paper["usdt_trading"])
-                paper["usdt_trading"] -= to_save
-                paper["usdt_sparen"]  += to_save
+        # ---- LONG sluiting (verkopen) ----
+        if o["side"] == "sell":
+            if trigger_long_price >= o["price"] * eps_up:
+                qty = o["qty"]; price = o["price"]
+                parts, filled = _fifo_take("open_entries", qty)
+                if filled <= 0:
+                    o["status"] = "filled"; continue
+                proceeds = filled * price
+                fee_sell = proceeds * PAPER_FEE_PCT
+                cost = sum(p["qty"] * p["entry"] for p in parts)
+                total_buy_fee = sum(p["fee_usdt"] for p in parts)
+                avg_entry = cost / max(sum(p["qty"] for p in parts), 1e-12)
+                pnl = proceeds - fee_sell - cost - total_buy_fee
+
+                paper["usdt_trading"] += (proceeds - fee_sell)
+                paper["xrp"] -= filled
+                paper["realized_pnl_usdt"] += pnl
+                paper["closed_trades"].append({
+                    "entry": round(avg_entry,6), "exit": round(price,6),
+                    "qty": round(filled,6), "pnl_usdt": round(pnl,6),
+                    "ts_entry": parts[0]["ts"] if parts else None, "ts_exit": now_ts
+                })
+                o["status"] = "filled"
                 if NOTIFY_TP_SL:
-                    send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
+                    send_telegram(f"🧪 PAPER SELL {filled:g} @ {price:.6f} (avg entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT")
+                if SPAREN_ENABLED and pnl > SPAREN_MIN_PNL_USDT and SPAREN_SPLIT_PCT > 0:
+                    to_save = min(pnl * (SPAREN_SPLIT_PCT/100.0), paper["usdt_trading"])
+                    paper["usdt_trading"] -= to_save; paper["usdt_sparen"] += to_save
+                    if NOTIFY_TP_SL:
+                        send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
+
+        # ---- SHORT sluiting (buy-to-cover) ----
+        elif o["side"] == "buy":
+            if trigger_short_price <= o["price"] * eps_dn:
+                qty = o["qty"]; price = o["price"]
+                parts, filled = _fifo_take("short_entries", qty)
+                if filled <= 0:
+                    o["status"] = "filled"; continue
+                cost_cover = filled * price
+                fee_buy = cost_cover * PAPER_FEE_PCT
+                proceeds_open = sum(p["qty"] * p["entry"] for p in parts)  # short-open proceeds
+                total_open_fee = sum(p["fee_usdt"] for p in parts)
+                avg_entry = proceeds_open / max(sum(p["qty"] for p in parts), 1e-12)
+                pnl = proceeds_open - cost_cover - total_open_fee - fee_buy  # (entry-exit)*qty - fees
+
+                paper["usdt_trading"] += pnl
+                paper["realized_pnl_usdt"] += pnl
+                paper["closed_trades"].append({
+                    "entry": round(avg_entry,6), "exit": round(price,6),
+                    "qty": round(filled,6), "pnl_usdt": round(pnl,6),
+                    "ts_entry": parts[0]["ts"] if parts else None, "ts_exit": now_ts
+                })
+                o["status"] = "filled"
+                if NOTIFY_TP_SL:
+                    send_telegram(f"🧪 PAPER BUY {filled:g} @ {price:.6f} (short cover; avg entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT")
+                if SPAREN_ENABLED and pnl > SPAREN_MIN_PNL_USDT and SPAREN_SPLIT_PCT > 0:
+                    to_save = min(pnl * (SPAREN_SPLIT_PCT/100.0), paper["usdt_trading"])
+                    paper["usdt_trading"] -= to_save; paper["usdt_sparen"] += to_save
+                    if NOTIFY_TP_SL:
+                        send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
+
     paper["open_orders"] = [o for o in paper["open_orders"] if o["status"] == "open"]
 
 # ===== Rapportage =====
@@ -344,7 +388,8 @@ def daily_report_text(ex):
     lines.append("")
     lines.append(f"(Spot) USDT: total≈<b>{usdt_total:.2f}</b> (free {spot.get('USDT_free',0.0):.2f} / used {spot.get('USDT_used',0.0):.2f}) ≈ €{eur:.2f}")
     if paper["enabled"]:
-        lines.append(f"(Paper) Trading≈{paper['usdt_trading']:.2f} | Sparen≈{paper['usdt_sparen']:.2f} | XRP≈{paper['xrp']:.4f} | Realized PnL≈{paper['realized_pnl_usdt']:.2f}")
+        short_qty = sum(e["qty"] for e in paper["short_entries"])
+        lines.append(f"(Paper) Trading≈{paper['usdt_trading']:.2f} | Sparen≈{paper['usdt_sparen']:.2f} | XRP(long)≈{paper['xrp']:.4f} | SHORT_qty≈{short_qty:.4f} | Realized≈{paper['realized_pnl_usdt']:.2f}")
     lines.append(f"Tijd: {fmt_ts(now_utc())}")
     return "\n".join(lines)
 
@@ -353,10 +398,12 @@ def paper_summary_dict():
         "balances": {
             "USDT_trading": round(paper["usdt_trading"], 6),
             "USDT_sparen":  round(paper["usdt_sparen"],  6),
-            "XRP":          round(paper["xrp"],          6),
+            "XRP_long":     round(paper["xrp"],          6),
+            "XRP_short_qty": round(sum(e["qty"] for e in paper["short_entries"]), 6),
         },
         "realized_pnl_usdt": round(paper["realized_pnl_usdt"], 6),
         "open_entries": paper["open_entries"],
+        "short_entries": paper["short_entries"],
         "open_tp_orders": paper["open_orders"],
         "closed_trades_count": len(paper["closed_trades"]),
     }
@@ -369,7 +416,8 @@ def build_closed_trades_csv():
     s = paper_summary_dict()
     w.writerow(["USDT_trading", s["balances"]["USDT_trading"]])
     w.writerow(["USDT_sparen",  s["balances"]["USDT_sparen"]])
-    w.writerow(["XRP",          s["balances"]["XRP"]])
+    w.writerow(["XRP_long",     s["balances"]["XRP_long"]])
+    w.writerow(["XRP_short_qty",s["balances"]["XRP_short_qty"]])
     w.writerow(["Realized_PnL_USDT", s["realized_pnl_usdt"]])
     w.writerow([])
     w.writerow(["entry","exit","qty","pnl_usdt","ts_entry","ts_exit"])
@@ -387,9 +435,10 @@ def send_paper_snapshot_to_telegram():
         "<b>PAPER snapshot</b>\n"
         f"Trading: <b>{s['balances']['USDT_trading']:.2f}</b> USDT\n"
         f"Sparen:  <b>{s['balances']['USDT_sparen']:.2f}</b> USDT\n"
-        f"XRP:     <b>{s['balances']['XRP']:.4f}</b>\n"
-        f"Realized PnL: <b>{s['realized_pnl_usdt']:.2f}</b> USDT\n"
-        f"Closed trades: {s['closed_trades_count']}\n"
+        f"XRP long: <b>{s['balances']['XRP_long']:.4f}</b>\n"
+        f"SHORT qty: <b>{s['balances']['XRP_short_qty']:.4f}</b>\n"
+        f"Realized PnL: <b>{paper['realized_pnl_usdt']:.2f}</b> USDT\n"
+        f"Closed trades: {len(paper['closed_trades'])}\n"
         f"Tijd: {fmt_ts(now_utc())}"
     )
     send_telegram(msg)
@@ -414,7 +463,7 @@ def bot_thread():
 
     send_telegram(
         f"🔧 Bot gestart — {SYMBOL} | perp={USE_PERP} lev={LEVERAGE} hedge={HEDGE_MODE} iso={MARGIN_MODE=='isolated'} | "
-        f"DRY_RUN={DRY_RUN} | PAPER={paper['enabled']}"
+        f"DRY_RUN={DRY_RUN} | PAPER={paper['enabled']} | L:{ENABLE_LONG} S:{ENABLE_SHORT}"
     )
 
     while not _stop.is_set():
@@ -456,18 +505,27 @@ def bot_thread():
                     f"Center≈{center:.6f} | Spacing≈{last_spacing:.6f}\nHTF: [{don_low:.6f} .. {don_high:.6f}]"
                 )
 
-            # === PAPER SIM (spot long-only) ===
-            if paper["enabled"] and ENABLE_LONG:
-                spacing, long_buys, _ = build_grids(center, atr, mode)
-                for px in long_buys:
-                    if close <= px and paper["usdt_trading"] >= BASE_ORDER_USDT:
-                        qty = paper_place_buy(px, int(time.time()*1000))
-                        if qty:
-                            paper_place_tp(qty, px, spacing, center)
+            # === PAPER SIM (long + optioneel short) ===
+            if paper["enabled"]:
+                spacing, long_buys, short_sells = build_grids(center, atr, mode)
 
-                # Wick- of close-based TP trigger:
-                trigger_long = hi if TP_TRIGGER_MODE == "wick" else close
-                paper_exec_tps(trigger_long, int(time.time()*1000))
+                if ENABLE_LONG:
+                    for px in long_buys:
+                        if close <= px and paper["usdt_trading"] >= BASE_ORDER_USDT:
+                            qty = paper_place_buy(px, int(time.time()*1000))
+                            if qty:
+                                paper_place_tp_long(qty, px, spacing, center)
+
+                if ENABLE_SHORT:
+                    for px in short_sells:
+                        if close >= px and paper["usdt_trading"] >= BASE_ORDER_USDT:
+                            qty = paper_place_short(px, int(time.time()*1000))
+                            if qty:
+                                paper_place_tp_short(qty, px, spacing, center)
+
+                trigger_long  = hi if TP_TRIGGER_MODE == "wick" else close
+                trigger_short = lo if TP_TRIGGER_MODE == "wick" else close
+                paper_exec_tps(trigger_long, trigger_short, int(time.time()*1000))
 
             # === LIVE fills (alleen als PAPER uit staat) ===
             if not paper["enabled"]:
@@ -490,7 +548,7 @@ def bot_thread():
                         my_pos_side = "LONG" if (pos_side=="LONG" or (HEDGE_MODE and side=="buy")) else \
                                       ("SHORT" if (pos_side=="SHORT" or (HEDGE_MODE and side=="sell")) else None)
                     else:
-                        if side == "sell":  # spot: sells niet als nieuwe fill tellen
+                        if side == "sell":
                             continue
                         my_pos_side = "LONG"
 
@@ -506,11 +564,11 @@ def bot_thread():
                     if NOTIFY_FILLS:
                         send_telegram(f"✅ Fill: {fills[fid]['side'].upper()} {amount:g} @ {price:.6f}")
 
-                    spacing = last_spacing or (last_atr * ATR_MULT if last_atr else atr * ATR_MULT)
-                    tp_price = compute_tp_price(TP_MODE, price, spacing, last_center if last_center is not None else center, fills[fid]["side"])
+                    spacing_eff = last_spacing or (last_atr * ATR_MULT if last_atr else atr * ATR_MULT)
+                    tp_price = compute_tp_price(TP_MODE, price, spacing_eff, last_center if last_center is not None else center, fills[fid]["side"])
                     try:
                         side_out = "sell" if fills[fid]["side"] == "long" else "buy"
-                        pos_tag  = "long" if fills[fid]["side"] == "long" else "short"
+                        pos_tag  = "LONG" if fills[fid]["side"] == "long" else "SHORT"
                         o = {"id":"TP"}
                         if not DRY_RUN:
                             o = ex.create_order(
@@ -519,7 +577,7 @@ def bot_thread():
                                 params={
                                     **({"postOnly": True} if POST_ONLY else {}),
                                     **({"reduceOnly": True} if (USE_PERP and REDUCE_ONLY_TP) else {}),
-                                    **({"positionSide": "LONG" if pos_tag=="long" else "SHORT"} if (USE_PERP and HEDGE_MODE) else {})
+                                    **({"positionSide": pos_tag} if (USE_PERP and HEDGE_MODE) else {})
                                 }
                             )
                         fills[fid]["tp"] = {"id": o.get("id", "TP"), "price": tp_price}
@@ -568,10 +626,13 @@ def bot_thread():
         time.sleep(POLL_SEC)
 
 # ===== Flask =====
+app = Flask(__name__)
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "symbol": SYMBOL, "perp": bool(USE_PERP), "hedge": bool(HEDGE_MODE),
-                    "paper": paper["enabled"], "ts": fmt_ts(now_utc())})
+                    "paper": paper["enabled"], "ts": fmt_ts(now_utc()),
+                    "enable_long": bool(ENABLE_LONG), "enable_short": bool(ENABLE_SHORT)})
 
 @app.get("/state")
 def state_ep():
@@ -588,9 +649,11 @@ def paper_ep():
         "paper_enabled": True,
         "balances": {"USDT_trading": round(paper["usdt_trading"], 4),
                      "USDT_sparen":  round(paper["usdt_sparen"],  4),
-                     "XRP":          round(paper["xrp"],          6)},
+                     "XRP_long":     round(paper["xrp"],          6),
+                     "XRP_short_qty": round(sum(e["qty"] for e in paper["short_entries"]), 6)},
         "realized_pnl_usdt": round(paper["realized_pnl_usdt"], 4),
         "open_entries": paper["open_entries"],
+        "short_entries": paper["short_entries"],
         "open_tp_orders": paper["open_orders"],
         "closed_trades_count": len(paper["closed_trades"])
     })
@@ -610,7 +673,7 @@ def paper_export_ep():
                     headers={"Content-Disposition": f"attachment; filename={fname}"})
 
 @app.post("/paper/reset")
-def paper_reset_ep():
+def paper_reset_route():
     confirm = request.args.get("confirm", "")
     if confirm.lower() not in ("ja", "yes", "ok", "ikweethet", "confirm"):
         return jsonify({"ok": False, "msg": "Bevestig met ?confirm=ikweethet"}), 400
