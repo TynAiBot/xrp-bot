@@ -288,12 +288,14 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
         if o["status"] != "open" or o["type"] != "tp": continue
 
         # ---- LONG sluiting (verkopen) ----
-        if o["side"] == "sell":
+        if o["side"] == "sell":  # close LONG
             if trigger_long_price >= o["price"] * eps_up:
                 qty = o["qty"]; price = o["price"]
                 parts, filled = _fifo_take("open_entries", qty)
                 if filled <= 0:
-                    o["status"] = "filled"; continue
+                    o["status"] = "filled"
+                    continue
+
                 proceeds = filled * price
                 fee_sell = proceeds * PAPER_FEE_PCT
                 cost = sum(p["qty"] * p["entry"] for p in parts)
@@ -305,48 +307,74 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                 paper["xrp"] -= filled
                 paper["realized_pnl_usdt"] += pnl
                 paper["closed_trades"].append({
-                    "entry": round(avg_entry,6), "exit": round(price,6),
-                    "qty": round(filled,6), "pnl_usdt": round(pnl,6),
-                    "ts_entry": parts[0]["ts"] if parts else None, "ts_exit": now_ts
+                    "entry": round(avg_entry,6), "exit": round(price,6), "qty": round(filled,6),
+                    "pnl_usdt": round(pnl,6), "ts_entry": parts[0]["ts"] if parts else None, "ts_exit": now_ts
                 })
                 o["status"] = "filled"
+
                 if NOTIFY_TP_SL:
                     send_telegram(f"🧪 PAPER SELL {filled:g} @ {price:.6f} (avg entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT")
+
                 if SPAREN_ENABLED and pnl > SPAREN_MIN_PNL_USDT and SPAREN_SPLIT_PCT > 0:
                     to_save = min(pnl * (SPAREN_SPLIT_PCT/100.0), paper["usdt_trading"])
-                    paper["usdt_trading"] -= to_save; paper["usdt_sparen"] += to_save
+                    paper["usdt_trading"] -= to_save
+                    paper["usdt_sparen"]  += to_save
                     if NOTIFY_TP_SL:
                         send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
 
+                # >>> compact overzicht na elke gesloten LONG
+                if NOTIFY_TP_SL:
+                    send_telegram(
+                        f"📊 PAPER: Realized {paper['realized_pnl_usdt']:.4f} USDT | "
+                        f"Trading {paper['usdt_trading']:.2f} | Sparen {paper['usdt_sparen']:.2f} | "
+                        f"Open LONG {paper['xrp']:.4f} | "
+                        f"Open SHORT {sum(e['qty'] for e in paper['short_entries']):.4f}"
+                    )
+
+
         # ---- SHORT sluiting (buy-to-cover) ----
-        elif o["side"] == "buy":
+        elif o["side"] == "buy":  # close SHORT (buy-to-cover)
             if trigger_short_price <= o["price"] * eps_dn:
                 qty = o["qty"]; price = o["price"]
                 parts, filled = _fifo_take("short_entries", qty)
                 if filled <= 0:
-                    o["status"] = "filled"; continue
-                cost_cover = filled * price
-                fee_buy = cost_cover * PAPER_FEE_PCT
-                proceeds_open = sum(p["qty"] * p["entry"] for p in parts)  # short-open proceeds
-                total_open_fee = sum(p["fee_usdt"] for p in parts)
-                avg_entry = proceeds_open / max(sum(p["qty"] for p in parts), 1e-12)
-                pnl = proceeds_open - cost_cover - total_open_fee - fee_buy  # (entry-exit)*qty - fees
+                    o["status"] = "filled"
+                    continue
 
-                paper["usdt_trading"] += pnl
+                cost_cover = filled * price
+                fee_buy    = cost_cover * PAPER_FEE_PCT
+                proceeds_open   = sum(p["qty"] * p["entry"] for p in parts)   # short-open proceeds
+                total_open_fee  = sum(p["fee_usdt"] for p in parts)
+                avg_entry = proceeds_open / max(sum(p["qty"] for p in parts), 1e-12)
+                pnl = proceeds_open - cost_cover - total_open_fee - fee_buy   # (entry-exit)*qty - fees
+
+                paper["usdt_trading"]      += pnl
                 paper["realized_pnl_usdt"] += pnl
                 paper["closed_trades"].append({
-                    "entry": round(avg_entry,6), "exit": round(price,6),
-                    "qty": round(filled,6), "pnl_usdt": round(pnl,6),
-                    "ts_entry": parts[0]["ts"] if parts else None, "ts_exit": now_ts
+                    "entry": round(avg_entry,6), "exit": round(price,6), "qty": round(filled,6),
+                    "pnl_usdt": round(pnl,6), "ts_entry": parts[0]["ts"] if parts else None, "ts_exit": now_ts
                 })
                 o["status"] = "filled"
+
                 if NOTIFY_TP_SL:
                     send_telegram(f"🧪 PAPER BUY {filled:g} @ {price:.6f} (short cover; avg entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT")
+
                 if SPAREN_ENABLED and pnl > SPAREN_MIN_PNL_USDT and SPAREN_SPLIT_PCT > 0:
                     to_save = min(pnl * (SPAREN_SPLIT_PCT/100.0), paper["usdt_trading"])
-                    paper["usdt_trading"] -= to_save; paper["usdt_sparen"] += to_save
+                    paper["usdt_trading"] -= to_save
+                    paper["usdt_sparen"]  += to_save
                     if NOTIFY_TP_SL:
                         send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
+
+                # >>> compact overzicht na elke gesloten SHORT
+                if NOTIFY_TP_SL:
+                    send_telegram(
+                        f"📊 PAPER: Realized {paper['realized_pnl_usdt']:.4f} USDT | "
+                        f"Trading {paper['usdt_trading']:.2f} | Sparen {paper['usdt_sparen']:.2f} | "
+                        f"Open LONG {paper['xrp']:.4f} | "
+                        f"Open SHORT {sum(e['qty'] for e in paper['short_entries']):.4f}"
+                    )
+
 
     paper["open_orders"] = [o for o in paper["open_orders"] if o["status"] == "open"]
 
@@ -686,5 +714,3 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=PORT)
     finally:
         _stop.set(); t.join(timeout=5)
-               
-
