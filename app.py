@@ -1,4 +1,4 @@
-import os, time, json, logging
+import os, time, json, logging, io, csv
 from datetime import datetime, timezone
 from threading import Thread, Event
 import pandas as pd
@@ -25,7 +25,7 @@ HEDGE_MODE  = int(os.getenv("HEDGE_MODE", "0"))
 DERIV_SETUP = int(os.getenv("DERIV_SETUP", "0"))     # 0: UI gebruiken, geen API-setup
 
 ENABLE_LONG  = int(os.getenv("ENABLE_LONG", "1"))
-ENABLE_SHORT = int(os.getenv("ENABLE_SHORT", "0"))
+ENABLE_SHORT = int(os.getenv("ENABLE_SHORT", "1"))   # zet default op 1 zodat bias effect zichtbaar is
 
 # Grid & indicators
 GRID_LAYERS   = int(os.getenv("GRID_LAYERS", "6"))
@@ -34,6 +34,13 @@ ATR_MULT      = float(os.getenv("ATR_MULT", "0.9"))
 ADX_LEN       = int(os.getenv("ADX_LEN", "14"))
 ADX_RANGE_TH  = float(os.getenv("ADX_RANGE_TH", "20"))
 DONCHIAN_LEN  = int(os.getenv("DONCHIAN_LEN", "100"))
+
+# Trend-bias settings
+BEARISH_BIAS   = int(os.getenv("BEARISH_BIAS", "1"))
+BULLISH_BIAS   = int(os.getenv("BULLISH_BIAS", "1"))
+BIAS_RATIO_SHORT = float(os.getenv("BIAS_RATIO_SHORT", "0.7"))  # % naar short in bearish
+BIAS_RATIO_LONG  = float(os.getenv("BIAS_RATIO_LONG",  "0.7"))  # % naar long in bullish
+BIAS_SHIFT_ATR   = float(os.getenv("BIAS_SHIFT_ATR",   "0.4"))  # center shift in ATRs
 
 # Exposure
 BASE_ORDER_USDT   = float(os.getenv("BASE_ORDER_USDT", "20"))
@@ -82,6 +89,10 @@ SPAREN_MIN_PNL_USDT = float(os.getenv("SPAREN_MIN_PNL_USDT", "0.01"))
 PAPER_EXPORT_FILENAME  = os.getenv("PAPER_EXPORT_FILENAME", "paper_closed_trades.csv")
 PAPER_SNAPSHOT_ENABLED = int(os.getenv("PAPER_SNAPSHOT_ENABLED", "1"))
 PAPER_SNAPSHOT_MIN     = int(os.getenv("PAPER_SNAPSHOT_MIN", "60"))
+
+# Rapportage
+REPORT_TG_ON_REBUILD  = int(os.getenv("REPORT_TG_ON_REBUILD", "0"))
+REPORT_INCLUDE_HOURLY = int(os.getenv("REPORT_INCLUDE_HOURLY", "1"))
 
 # Telegram & web
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -192,14 +203,40 @@ def compute_indicators(df_ltf: pd.DataFrame, df_htf: pd.DataFrame):
 
 def decide_regime(adx_val): return "range" if adx_val < ADX_RANGE_TH else "trend"
 
-def build_grids(center, atr_val, mode):
+# ===== Bias-aware grids =====
+def build_grids(center, atr_val, mode, bias=None):
+    """
+    Bouwt grid-levels.
+    bias:
+      None        = symmetrisch
+      'bearish'   = meer short-levels + lichte center-shift omlaag
+      'bullish'   = meer long-levels  + lichte center-shift omhoog
+    """
     spacing = max(1e-8, atr_val * ATR_MULT)
-    if mode == "trend": spacing *= 1.8
+    if mode == "trend":
+        spacing *= 1.8  # ruimer in trend
+
+    total_layers = GRID_LAYERS
+    long_layers  = total_layers
+    short_layers = total_layers
+    center_adj = center
+
+    if bias == "bearish":
+        short_layers = max(1, int(round(total_layers * BIAS_RATIO_SHORT)))
+        long_layers  = max(1, total_layers - short_layers)
+        center_adj   = center - (atr_val * BIAS_SHIFT_ATR)
+    elif bias == "bullish":
+        long_layers  = max(1, int(round(total_layers * BIAS_RATIO_LONG)))
+        short_layers = max(1, total_layers - long_layers)
+        center_adj   = center + (atr_val * BIAS_SHIFT_ATR)
+
     long_buys, short_sells = [], []
-    for i in range(1, GRID_LAYERS + 1):
-        long_buys.append(round(center - i * spacing, 8))
-        short_sells.append(round(center + i * spacing, 8))
-    return spacing, long_buys, short_sells
+    for i in range(1, long_layers + 1):
+        long_buys.append(round(center_adj - i * spacing, 8))
+    for i in range(1, short_layers + 1):
+        short_sells.append(round(center_adj + i * spacing, 8))
+
+    return spacing, long_buys, short_sells, center_adj
 
 def compute_tp_price(mode, entry, spacing, center, side):
     if mode == "midline":
@@ -331,7 +368,6 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                         f"Open SHORT {sum(e['qty'] for e in paper['short_entries']):.4f}"
                     )
 
-
         # ---- SHORT sluiting (buy-to-cover) ----
         elif o["side"] == "buy":  # close SHORT (buy-to-cover)
             if trigger_short_price <= o["price"] * eps_dn:
@@ -374,7 +410,6 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                         f"Open LONG {paper['xrp']:.4f} | "
                         f"Open SHORT {sum(e['qty'] for e in paper['short_entries']):.4f}"
                     )
-
 
     paper["open_orders"] = [o for o in paper["open_orders"] if o["status"] == "open"]
 
@@ -437,7 +472,6 @@ def paper_summary_dict():
     }
 
 def build_closed_trades_csv():
-    import io, csv
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["# PAPER SUMMARY"])
@@ -455,6 +489,64 @@ def build_closed_trades_csv():
             t.get("ts_entry"), t.get("ts_exit")
         ])
     return buf.getvalue()
+
+def compute_report_kpis():
+    trades = paper.get("closed_trades", []) or []
+    if not trades:
+        return {
+            "closed_trades": 0, "realized_total_usdt": 0.0, "win_rate_percent": None,
+            "avg_pnl": None, "median_pnl": None
+        }
+    pnl_list = [float(t.get("pnl_usdt", 0.0)) for t in trades]
+    wins = sum(1 for p in pnl_list if p > 0)
+    win_rate = 100.0 * wins / max(1, len(pnl_list))
+    avg_pnl = sum(pnl_list) / len(pnl_list)
+    med_pnl = sorted(pnl_list)[len(pnl_list)//2]
+    return {
+        "closed_trades": len(pnl_list),
+        "realized_total_usdt": round(sum(pnl_list), 6),
+        "win_rate_percent": round(win_rate, 2),
+        "avg_pnl": round(avg_pnl, 6),
+        "median_pnl": round(med_pnl, 6)
+    }
+
+def build_report_csv(include_hourly=True):
+    k = compute_report_kpis()
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["# REPORT KPI"])
+    for key, val in k.items():
+        w.writerow([key, val])
+    if include_hourly:
+        w.writerow([])
+        w.writerow(["# hourly_pnl"])
+        w.writerow(["hour", "pnl_usdt"])
+        hourly = {}
+        for t in paper.get("closed_trades", []) or []:
+            ts_exit = t.get("ts_exit")
+            if not ts_exit:
+                continue
+            try:
+                ts = pd.to_datetime(ts_exit, unit="ms", utc=True)
+            except Exception:
+                try: ts = pd.to_datetime(ts_exit)
+                except Exception: continue
+            hour_key = ts.tz_convert(None).strftime("%Y-%m-%d %H:00")
+            hourly[hour_key] = hourly.get(hour_key, 0.0) + float(t.get("pnl_usdt", 0.0))
+        for h, v in sorted(hourly.items()):
+            w.writerow([h, round(v, 6)])
+    return out.getvalue()
+
+def send_report_to_telegram():
+    k = compute_report_kpis()
+    msg = (
+        "<b>Grid Report</b>\n"
+        f"Closed trades: <b>{k['closed_trades']}</b>\n"
+        f"Realized PnL: <b>{k['realized_total_usdt']:.4f}</b> USDT\n"
+        f"Win-rate: <b>{k['win_rate_percent'] if k['win_rate_percent'] is not None else 'n/a'}%</b>\n"
+        f"Avg/Med PnL: {k['avg_pnl'] if k['avg_pnl'] is not None else 'n/a'} / {k['median_pnl'] if k['median_pnl'] is not None else 'n/a'} USDT"
+    )
+    send_telegram(msg)
 
 def send_paper_snapshot_to_telegram():
     if not (TG_TOKEN and TG_CHAT_ID): return
@@ -485,7 +577,6 @@ def bot_thread():
     grid_live  = state.get("grid_live", False)
     last_spacing = state.get("last_spacing")
 
-    total_g = total_l = total_s = 0.0
     if paper["enabled"]:
         paper_reset()
 
@@ -512,6 +603,14 @@ def bot_thread():
             lower_break = don_low  - atr * BREAKOUT_ATR_MULT
             upper_break = don_high + atr * BREAKOUT_ATR_MULT
 
+            # ---- kies bias (alleen in trend mode)
+            bias = None
+            if mode == "trend":
+                if BEARISH_BIAS and close < ema200:
+                    bias = "bearish"
+                elif BULLISH_BIAS and close > ema200:
+                    bias = "bullish"
+
             need_rebuild = (last_atr is None or last_mode is None or last_center is None or not grid_live)
             if not need_rebuild:
                 if abs(atr - last_atr) / max(1e-8, last_atr) > REBUILD_ATR_DELTA: need_rebuild = True
@@ -521,35 +620,43 @@ def bot_thread():
                     need_rebuild = True
 
             if need_rebuild:
-                last_spacing, long_buys, short_sells = build_grids(center, atr, mode)
+                last_spacing, long_buys, short_sells, center_adj = build_grids(center, atr, mode, bias=bias)
+                center = center_adj
                 grid_live = True; last_atr, last_mode, last_center = atr, mode, center
                 save_state({
                     "last_atr": last_atr, "last_mode": last_mode, "last_center": last_center, "grid_live": grid_live,
                     "last_spacing": last_spacing, "updated_at": now_utc().isoformat(),
                     "last_levels": {"long_buys": long_buys, "short_sells": short_sells}
                 })
-                send_telegram(
+                msg = (
                     f"🔁 Rebuild grid — Mode <b>{mode}</b> | ADX≈{adx:.1f} | ATR≈{atr:.6f}\n"
                     f"Center≈{center:.6f} | Spacing≈{last_spacing:.6f}\nHTF: [{don_low:.6f} .. {don_high:.6f}]"
                 )
+                if bias == "bearish":
+                    msg += "\n🧭 Bias: <b>bearish</b> (meer shorts + center↓)"
+                elif bias == "bullish":
+                    msg += "\n🧭 Bias: <b>bullish</b> (meer longs + center↑)"
+                send_telegram(msg)
+                if REPORT_TG_ON_REBUILD:
+                    send_report_to_telegram()
 
-            # === PAPER SIM (long + optioneel short) ===
+            # === PAPER SIM (long + short) ===
             if paper["enabled"]:
-                spacing, long_buys, short_sells = build_grids(center, atr, mode)
+                spacing, long_buys, short_sells, center_adj = build_grids(center, atr, mode, bias=bias)
 
                 if ENABLE_LONG:
                     for px in long_buys:
                         if close <= px and paper["usdt_trading"] >= BASE_ORDER_USDT:
                             qty = paper_place_buy(px, int(time.time()*1000))
                             if qty:
-                                paper_place_tp_long(qty, px, spacing, center)
+                                paper_place_tp_long(qty, px, spacing, center_adj)
 
                 if ENABLE_SHORT:
                     for px in short_sells:
                         if close >= px and paper["usdt_trading"] >= BASE_ORDER_USDT:
                             qty = paper_place_short(px, int(time.time()*1000))
                             if qty:
-                                paper_place_tp_short(qty, px, spacing, center)
+                                paper_place_tp_short(qty, px, spacing, center_adj)
 
                 trigger_long  = hi if TP_TRIGGER_MODE == "wick" else close
                 trigger_short = lo if TP_TRIGGER_MODE == "wick" else close
@@ -625,7 +732,7 @@ def bot_thread():
                 "mode": mode, "center": center, "atr": atr, "adx": adx,
                 "spacing": last_spacing or (atr * ATR_MULT),
                 "don_low": don_low, "don_high": don_high,
-                "long_notional": total_l, "short_notional": total_s, "global_notional": total_g
+                "long_notional": 0.0, "short_notional": 0.0, "global_notional": 0.0
             })
 
             # Dagrapport
@@ -646,7 +753,7 @@ def bot_thread():
                 except Exception:
                     pass
 
-            logging.info(f"Tick | close={close:.6f} ADX={adx:.1f} ATR={atr:.6f} mode={mode}")
+            logging.info(f"Tick | close={close:.6f} ADX={adx:.1f} ATR={atr:.6f} mode={mode} bias={bias}")
 
         except Exception as e:
             logging.exception(f"Loop error: {e}")
@@ -707,6 +814,19 @@ def paper_reset_route():
         return jsonify({"ok": False, "msg": "Bevestig met ?confirm=ikweethet"}), 400
     paper_reset()
     return jsonify({"ok": True, "msg": "Paper reset", "state": paper_summary_dict()})
+
+# ---- Nieuwe report endpoints ----
+@app.get("/report/export")
+def report_export_ep():
+    inc_hourly = bool(REPORT_INCLUDE_HOURLY)
+    csv_text = build_report_csv(include_hourly=inc_hourly)
+    return Response(csv_text, mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=report_summary.csv"})
+
+@app.post("/report/telegram")
+def report_telegram_ep():
+    send_report_to_telegram()
+    return jsonify({"ok": True, "msg": "Report to Telegram verzonden."})
 
 if __name__ == "__main__":
     t = Thread(target=bot_thread, daemon=True); t.start()
