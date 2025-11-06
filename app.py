@@ -25,7 +25,7 @@ HEDGE_MODE  = int(os.getenv("HEDGE_MODE", "0"))
 DERIV_SETUP = int(os.getenv("DERIV_SETUP", "0"))     # 0: UI gebruiken, geen API-setup
 
 ENABLE_LONG  = int(os.getenv("ENABLE_LONG", "1"))
-ENABLE_SHORT = int(os.getenv("ENABLE_SHORT", "1"))   # zet default op 1 zodat bias effect zichtbaar is
+ENABLE_SHORT = int(os.getenv("ENABLE_SHORT", "1"))
 
 # Grid & indicators
 GRID_LAYERS   = int(os.getenv("GRID_LAYERS", "6"))
@@ -36,8 +36,8 @@ ADX_RANGE_TH  = float(os.getenv("ADX_RANGE_TH", "20"))
 DONCHIAN_LEN  = int(os.getenv("DONCHIAN_LEN", "100"))
 
 # Trend-bias settings
-BEARISH_BIAS   = int(os.getenv("BEARISH_BIAS", "1"))
-BULLISH_BIAS   = int(os.getenv("BULLISH_BIAS", "1"))
+BEARISH_BIAS     = int(os.getenv("BEARISH_BIAS", "1"))
+BULLISH_BIAS     = int(os.getenv("BULLISH_BIAS", "1"))
 BIAS_RATIO_SHORT = float(os.getenv("BIAS_RATIO_SHORT", "0.7"))  # % naar short in bearish
 BIAS_RATIO_LONG  = float(os.getenv("BIAS_RATIO_LONG",  "0.7"))  # % naar long in bullish
 BIAS_SHIFT_ATR   = float(os.getenv("BIAS_SHIFT_ATR",   "0.4"))  # center shift in ATRs
@@ -67,15 +67,19 @@ TP_MODE         = os.getenv("TP_MODE", "spacing")  # midline|spacing|pct
 TP_SPACING_MULT = float(os.getenv("TP_SPACING_MULT", "1.0"))
 TP_PCT          = float(os.getenv("TP_PCT", "0.004"))
 ATR_SL_MULT     = float(os.getenv("ATR_SL_MULT", "2.0"))
-NOTIFY_FILLS    = int(os.getenv("NOTIFY_FILLS", "1"))
-NOTIFY_TP_SL    = int(os.getenv("NOTIFY_TP_SL", "1"))
+
+NOTIFY_FILLS    = int(os.getenv("NOTIFY_FILLS", "1"))   # BUY/SHORT-open
+NOTIFY_TP_SL    = int(os.getenv("NOTIFY_TP_SL", "1"))   # SELL/cover PnL
+
+# Stilte-profiel (nieuw)
+NOTIFY_REBUILD       = int(os.getenv("NOTIFY_REBUILD", "0"))
+NOTIFY_TP_PLACED     = int(os.getenv("NOTIFY_TP_PLACED", "0"))
+NOTIFY_SPAREN        = int(os.getenv("NOTIFY_SPAREN", "0"))
+NOTIFY_SELL_OVERVIEW = int(os.getenv("NOTIFY_SELL_OVERVIEW", "0"))
 
 # Trigger op wick of close + coulance
 TP_TRIGGER_MODE = os.getenv("TP_TRIGGER_MODE", "wick").lower()  # close|wick
 PAPER_EPS_PCT   = float(os.getenv("PAPER_EPS_PCT", "0.0005"))
-
-# Trades fetch window (live fills)
-TRADES_LOOKBACK_S = int(os.getenv("TRADES_LOOKBACK_S", "0"))
 
 # Paper trading + Sparen
 PAPER_MODE          = int(os.getenv("PAPER_MODE", "1"))
@@ -87,7 +91,7 @@ SPAREN_MIN_PNL_USDT = float(os.getenv("SPAREN_MIN_PNL_USDT", "0.01"))
 
 # Paper export & snapshots
 PAPER_EXPORT_FILENAME  = os.getenv("PAPER_EXPORT_FILENAME", "paper_closed_trades.csv")
-PAPER_SNAPSHOT_ENABLED = int(os.getenv("PAPER_SNAPSHOT_ENABLED", "1"))
+PAPER_SNAPSHOT_ENABLED = int(os.getenv("PAPER_SNAPSHOT_ENABLED", "0"))  # default uit voor rust
 PAPER_SNAPSHOT_MIN     = int(os.getenv("PAPER_SNAPSHOT_MIN", "60"))
 
 # Rapportage
@@ -123,7 +127,7 @@ paper = {
     "xrp": 0.0,                         # long inventory
     "realized_pnl_usdt": 0.0,
     "open_entries": [],                 # LONG lots [{qty, entry, fee_usdt, ts}]
-    "short_entries": [],                # SHORT lots [{qty, entry, fee_usdt, ts}]  entry=short-open price
+    "short_entries": [],                # SHORT lots [{qty, entry, fee_usdt, ts}]
     "open_orders": [],                  # [{'id','type':'tp','side':'sell'|'buy','price','qty','status'}]
     "closed_trades": []                 # [{'entry','exit','qty','pnl_usdt','ts_entry','ts_exit'}]
 }
@@ -282,14 +286,15 @@ def paper_place_tp_long(qty, entry_price, spacing, center):
     tp = compute_tp_price(TP_MODE, entry_price, spacing, center, "long")
     oid = f"PTP-L-{int(time.time()*1000)}-{tp}"
     paper["open_orders"].append({"id": oid, "type": "tp", "side": "sell", "price": tp, "qty": qty, "status": "open"})
-    if NOTIFY_TP_SL: send_telegram(f"🧪 PAPER TP geplaatst SELL @ {tp:.6f}")
+    if NOTIFY_TP_PLACED:
+        send_telegram(f"🧪 PAPER TP geplaatst SELL @ {tp:.6f}")
 
 def paper_place_short(price, now_ts):
     """Open een SHORT in paper: verkoop eerst, later terugkopen."""
     usdt_notional = BASE_ORDER_USDT
     qty = round(usdt_notional / max(price, 1e-12), 6)
     fee_open = usdt_notional * PAPER_FEE_PCT
-    paper["usdt_trading"] -= fee_open   # perps-fee in USDT
+    paper["usdt_trading"] -= fee_open
     paper["short_entries"].append({"qty": qty, "entry": price, "fee_usdt": fee_open, "ts": now_ts})
     if NOTIFY_FILLS:
         send_telegram(f"🧪 PAPER SHORT {qty:g} @ {price:.6f} (fee {fee_open:.4f} USDT)")
@@ -299,7 +304,7 @@ def paper_place_tp_short(qty, entry_price, spacing, center):
     tp = compute_tp_price(TP_MODE, entry_price, spacing, center, "short")  # lager dan entry
     oid = f"PTP-S-{int(time.time()*1000)}-{tp}"
     paper["open_orders"].append({"id": oid, "type": "tp", "side": "buy", "price": tp, "qty": qty, "status": "open"})
-    if NOTIFY_TP_SL:
+    if NOTIFY_TP_PLACED:
         send_telegram(f"🧪 PAPER TP geplaatst BUY @ {tp:.6f} (short)")
 
 def _fifo_take(lots_key, qty_need):
@@ -356,11 +361,10 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                     to_save = min(pnl * (SPAREN_SPLIT_PCT/100.0), paper["usdt_trading"])
                     paper["usdt_trading"] -= to_save
                     paper["usdt_sparen"]  += to_save
-                    if NOTIFY_TP_SL:
+                    if NOTIFY_SPAREN:
                         send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
 
-                # >>> compact overzicht na elke gesloten LONG
-                if NOTIFY_TP_SL:
+                if NOTIFY_SELL_OVERVIEW:
                     send_telegram(
                         f"📊 PAPER: Realized {paper['realized_pnl_usdt']:.4f} USDT | "
                         f"Trading {paper['usdt_trading']:.2f} | Sparen {paper['usdt_sparen']:.2f} | "
@@ -379,10 +383,10 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
 
                 cost_cover = filled * price
                 fee_buy    = cost_cover * PAPER_FEE_PCT
-                proceeds_open   = sum(p["qty"] * p["entry"] for p in parts)   # short-open proceeds
+                proceeds_open   = sum(p["qty"] * p["entry"] for p in parts)
                 total_open_fee  = sum(p["fee_usdt"] for p in parts)
                 avg_entry = proceeds_open / max(sum(p["qty"] for p in parts), 1e-12)
-                pnl = proceeds_open - cost_cover - total_open_fee - fee_buy   # (entry-exit)*qty - fees
+                pnl = proceeds_open - cost_cover - total_open_fee - fee_buy
 
                 paper["usdt_trading"]      += pnl
                 paper["realized_pnl_usdt"] += pnl
@@ -399,11 +403,10 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                     to_save = min(pnl * (SPAREN_SPLIT_PCT/100.0), paper["usdt_trading"])
                     paper["usdt_trading"] -= to_save
                     paper["usdt_sparen"]  += to_save
-                    if NOTIFY_TP_SL:
+                    if NOTIFY_SPAREN:
                         send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
 
-                # >>> compact overzicht na elke gesloten SHORT
-                if NOTIFY_TP_SL:
+                if NOTIFY_SELL_OVERVIEW:
                     send_telegram(
                         f"📊 PAPER: Realized {paper['realized_pnl_usdt']:.4f} USDT | "
                         f"Trading {paper['usdt_trading']:.2f} | Sparen {paper['usdt_sparen']:.2f} | "
@@ -568,7 +571,7 @@ def bot_thread():
     global last_trade_ms, last_paper_snapshot_min
     ex = ccxt_client(); set_deriv_modes(ex)
 
-    last_trade_ms = int(time.time() * 1000) - TRADES_LOOKBACK_S * 1000
+    last_trade_ms = int(time.time() * 1000)
 
     state = load_state()
     last_atr   = state.get("last_atr")
@@ -616,7 +619,8 @@ def bot_thread():
                 if abs(atr - last_atr) / max(1e-8, last_atr) > REBUILD_ATR_DELTA: need_rebuild = True
                 if mode != last_mode: need_rebuild = True
                 if close < lower_break or close > upper_break:
-                    send_telegram(f"⚠️ Breakout: close {close:.6f} buiten [{lower_break:.6f}, {upper_break:.6f}] — rebuild")
+                    if NOTIFY_REBUILD:
+                        send_telegram(f"⚠️ Breakout: close {close:.6f} buiten [{lower_break:.6f}, {upper_break:.6f}] — rebuild")
                     need_rebuild = True
 
             if need_rebuild:
@@ -636,7 +640,8 @@ def bot_thread():
                     msg += "\n🧭 Bias: <b>bearish</b> (meer shorts + center↓)"
                 elif bias == "bullish":
                     msg += "\n🧭 Bias: <b>bullish</b> (meer longs + center↑)"
-                send_telegram(msg)
+                if NOTIFY_REBUILD:
+                    send_telegram(msg)
                 if REPORT_TG_ON_REBUILD:
                     send_report_to_telegram()
 
@@ -662,71 +667,6 @@ def bot_thread():
                 trigger_short = lo if TP_TRIGGER_MODE == "wick" else close
                 paper_exec_tps(trigger_long, trigger_short, int(time.time()*1000))
 
-            # === LIVE fills (alleen als PAPER uit staat) ===
-            if not paper["enabled"]:
-                try:
-                    trades = ex.fetch_my_trades(SYMBOL, since=last_trade_ms or None, limit=100)
-                except Exception as e:
-                    trades = []; logging.debug(f"fetch_my_trades: {e}")
-
-                new_max_ms = last_trade_ms
-                for tr in trades or []:
-                    ts = int(tr.get("timestamp") or 0)
-                    if ts and ts <= last_trade_ms: continue
-                    new_max_ms = max(new_max_ms, ts or 0)
-
-                    side = tr.get("side")  # 'buy'/'sell'
-                    info = tr.get("info", {})
-                    pos_side = (info.get("positionSide") or info.get("posSide") or "").upper()
-
-                    if USE_PERP:
-                        my_pos_side = "LONG" if (pos_side=="LONG" or (HEDGE_MODE and side=="buy")) else \
-                                      ("SHORT" if (pos_side=="SHORT" or (HEDGE_MODE and side=="sell")) else None)
-                    else:
-                        if side == "sell":
-                            continue
-                        my_pos_side = "LONG"
-
-                    price  = float(tr.get("price") or tr.get("info", {}).get("price") or 0)
-                    amount = float(tr.get("amount") or tr.get("contracts") or 0)
-                    if amount <= 0 or price <= 0: continue
-
-                    fid = tr.get("id") or f"{ts}-{side}-{price}"
-                    if fid in fills: continue
-
-                    fills[fid] = {"side": "long" if my_pos_side=="LONG" else "short",
-                                  "entry_price": price, "qty": amount, "tp": None, "sl": None, "active": True}
-                    if NOTIFY_FILLS:
-                        send_telegram(f"✅ Fill: {fills[fid]['side'].upper()} {amount:g} @ {price:.6f}")
-
-                    spacing_eff = last_spacing or (last_atr * ATR_MULT if last_atr else atr * ATR_MULT)
-                    tp_price = compute_tp_price(TP_MODE, price, spacing_eff, last_center if last_center is not None else center, fills[fid]["side"])
-                    try:
-                        side_out = "sell" if fills[fid]["side"] == "long" else "buy"
-                        pos_tag  = "LONG" if fills[fid]["side"] == "long" else "SHORT"
-                        o = {"id":"TP"}
-                        if not DRY_RUN:
-                            o = ex.create_order(
-                                SYMBOL, type="limit", side=side_out,
-                                amount=amount, price=tp_price,
-                                params={
-                                    **({"postOnly": True} if POST_ONLY else {}),
-                                    **({"reduceOnly": True} if (USE_PERP and REDUCE_ONLY_TP) else {}),
-                                    **({"positionSide": pos_tag} if (USE_PERP and HEDGE_MODE) else {})
-                                }
-                            )
-                        fills[fid]["tp"] = {"id": o.get("id", "TP"), "price": tp_price}
-                        if NOTIFY_TP_SL:
-                            ro = "RO " if (USE_PERP and REDUCE_ONLY_TP) else ""
-                            send_telegram(f"🎯 TP geplaatst: {side_out.upper()} {ro}@ {tp_price:.6f} (entry {price:.6f})")
-                    except Exception as e:
-                        logging.warning(f"TP place fail: {e}")
-
-                    sl_price = compute_sl_price(price, last_atr if last_atr is not None else atr, fills[fid]["side"])
-                    fills[fid]["sl"] = {"price": sl_price}
-
-                if new_max_ms > last_trade_ms: last_trade_ms = new_max_ms
-
             # === Runtime + rapporten ===
             runtime.update({
                 "mode": mode, "center": center, "atr": atr, "adx": adx,
@@ -742,7 +682,7 @@ def bot_thread():
                     send_telegram(daily_report_text(ex))
                     runtime["last_report"] = stamp
 
-            # Uurlijkse (of N-min) paper-snapshot
+            # Uurlijkse (of N-min) paper-snapshot (default uit)
             if PAPER_SNAPSHOT_ENABLED and paper["enabled"]:
                 try:
                     minute = int(datetime.now().strftime("%M"))
@@ -771,8 +711,11 @@ def health():
 
 @app.get("/state")
 def state_ep():
-    ex = ccxt_client()
-    xrep = fetch_balances_report(ex)
+    try:
+        ex = ccxt_client()
+        xrep = fetch_balances_report(ex)
+    except Exception:
+        xrep = None
     return jsonify({"runtime": runtime, "fills_active": len(fills), "paper_enabled": paper["enabled"],
                     "exchange_balances": xrep})
 
@@ -815,7 +758,7 @@ def paper_reset_route():
     paper_reset()
     return jsonify({"ok": True, "msg": "Paper reset", "state": paper_summary_dict()})
 
-# ---- Nieuwe report endpoints ----
+# ---- Report endpoints ----
 @app.get("/report/export")
 def report_export_ep():
     inc_hourly = bool(REPORT_INCLUDE_HOURLY)
