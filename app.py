@@ -20,10 +20,11 @@ HTF       = os.getenv("HTF", "1h")
 # Spot/perps
 USE_PERP    = int(os.getenv("USE_PERP", "0"))
 LEVERAGE    = int(os.getenv("LEVERAGE", "3"))
-MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")  # isolated|cross
+MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")   # isolated|cross
 HEDGE_MODE  = int(os.getenv("HEDGE_MODE", "0"))
-DERIV_SETUP = int(os.getenv("DERIV_SETUP", "0"))     # 0: UI gebruiken, geen API-setup
+DERIV_SETUP = int(os.getenv("DERIV_SETUP", "0"))      # 0: UI gebruiken, geen API-setup
 
+# Kanten aan/uit
 ENABLE_LONG  = int(os.getenv("ENABLE_LONG", "1"))
 ENABLE_SHORT = int(os.getenv("ENABLE_SHORT", "1"))
 
@@ -34,6 +35,10 @@ ATR_MULT      = float(os.getenv("ATR_MULT", "0.9"))
 ADX_LEN       = int(os.getenv("ADX_LEN", "14"))
 ADX_RANGE_TH  = float(os.getenv("ADX_RANGE_TH", "20"))
 DONCHIAN_LEN  = int(os.getenv("DONCHIAN_LEN", "100"))
+
+# Low-vol dynamische lagen
+VOL_MIN_MULT        = float(os.getenv("VOL_MIN_MULT", "0.70"))    # ATR < 0.70*medianATR -> lowvol
+LOWVOL_LAYER_FACTOR = float(os.getenv("LOWVOL_LAYER_FACTOR", "0.50"))  # % van GRID_LAYERS in lowvol
 
 # Trend-bias settings
 BEARISH_BIAS     = int(os.getenv("BEARISH_BIAS", "1"))
@@ -71,13 +76,13 @@ ATR_SL_MULT     = float(os.getenv("ATR_SL_MULT", "2.0"))
 NOTIFY_FILLS    = int(os.getenv("NOTIFY_FILLS", "1"))   # BUY/SHORT-open
 NOTIFY_TP_SL    = int(os.getenv("NOTIFY_TP_SL", "1"))   # SELL/cover PnL
 
-# Stilte-profiel (nieuw)
+# Stilte-profiel (alles uit behalve fills en afsluitingen)
 NOTIFY_REBUILD       = int(os.getenv("NOTIFY_REBUILD", "0"))
 NOTIFY_TP_PLACED     = int(os.getenv("NOTIFY_TP_PLACED", "0"))
 NOTIFY_SPAREN        = int(os.getenv("NOTIFY_SPAREN", "0"))
 NOTIFY_SELL_OVERVIEW = int(os.getenv("NOTIFY_SELL_OVERVIEW", "0"))
 
-# Trigger op wick of close + coulance
+# TP trigger
 TP_TRIGGER_MODE = os.getenv("TP_TRIGGER_MODE", "wick").lower()  # close|wick
 PAPER_EPS_PCT   = float(os.getenv("PAPER_EPS_PCT", "0.0005"))
 
@@ -91,7 +96,7 @@ SPAREN_MIN_PNL_USDT = float(os.getenv("SPAREN_MIN_PNL_USDT", "0.01"))
 
 # Paper export & snapshots
 PAPER_EXPORT_FILENAME  = os.getenv("PAPER_EXPORT_FILENAME", "paper_closed_trades.csv")
-PAPER_SNAPSHOT_ENABLED = int(os.getenv("PAPER_SNAPSHOT_ENABLED", "0"))  # default uit voor rust
+PAPER_SNAPSHOT_ENABLED = int(os.getenv("PAPER_SNAPSHOT_ENABLED", "0"))
 PAPER_SNAPSHOT_MIN     = int(os.getenv("PAPER_SNAPSHOT_MIN", "60"))
 
 # Rapportage
@@ -117,7 +122,7 @@ runtime = {"mode":None,"center":None,"atr":None,"adx":None,"spacing":None,
 last_trade_ms = 0
 last_paper_snapshot_min = None
 
-fills = {}  # live fills
+fills = {}
 
 # Paper state
 paper = {
@@ -128,8 +133,8 @@ paper = {
     "realized_pnl_usdt": 0.0,
     "open_entries": [],                 # LONG lots [{qty, entry, fee_usdt, ts}]
     "short_entries": [],                # SHORT lots [{qty, entry, fee_usdt, ts}]
-    "open_orders": [],                  # [{'id','type':'tp','side':'sell'|'buy','price','qty','status'}]
-    "closed_trades": []                 # [{'entry','exit','qty','pnl_usdt','ts_entry','ts_exit'}]
+    "open_orders": [],                  # [{'id','type':'tp','side','price','qty','status'}]
+    "closed_trades": []
 }
 
 # ===== Utils =====
@@ -207,20 +212,19 @@ def compute_indicators(df_ltf: pd.DataFrame, df_htf: pd.DataFrame):
 
 def decide_regime(adx_val): return "range" if adx_val < ADX_RANGE_TH else "trend"
 
-# ===== Bias-aware grids =====
-def build_grids(center, atr_val, mode, bias=None):
+# ===== Bias-aware grids (compact + lowvol) =====
+def build_grids(center, atr_val, mode, total_layers, bias=None):
     """
-    Bouwt grid-levels.
+    total_layers: effectief aantal lagen (kan dynamisch verlaagd worden bij low-vol)
     bias:
       None        = symmetrisch
-      'bearish'   = meer short-levels + lichte center-shift omlaag
-      'bullish'   = meer long-levels  + lichte center-shift omhoog
+      'bearish'   = meer shorts + center-shift omlaag
+      'bullish'   = meer longs  + center-shift omhoog
     """
     spacing = max(1e-8, atr_val * ATR_MULT)
     if mode == "trend":
         spacing *= 1.8  # ruimer in trend
 
-    total_layers = GRID_LAYERS
     long_layers  = total_layers
     short_layers = total_layers
     center_adj = center
@@ -290,7 +294,6 @@ def paper_place_tp_long(qty, entry_price, spacing, center):
         send_telegram(f"🧪 PAPER TP geplaatst SELL @ {tp:.6f}")
 
 def paper_place_short(price, now_ts):
-    """Open een SHORT in paper: verkoop eerst, later terugkopen."""
     usdt_notional = BASE_ORDER_USDT
     qty = round(usdt_notional / max(price, 1e-12), 6)
     fee_open = usdt_notional * PAPER_FEE_PCT
@@ -301,7 +304,7 @@ def paper_place_short(price, now_ts):
     return qty
 
 def paper_place_tp_short(qty, entry_price, spacing, center):
-    tp = compute_tp_price(TP_MODE, entry_price, spacing, center, "short")  # lager dan entry
+    tp = compute_tp_price(TP_MODE, entry_price, spacing, center, "short")
     oid = f"PTP-S-{int(time.time()*1000)}-{tp}"
     paper["open_orders"].append({"id": oid, "type": "tp", "side": "buy", "price": tp, "qty": qty, "status": "open"})
     if NOTIFY_TP_PLACED:
@@ -319,17 +322,13 @@ def _fifo_take(lots_key, qty_need):
     return taken, qty_need - qty_left
 
 def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
-    """Execute TP's.
-       longs: side=='sell'  → hit als trigger_long >= tp*(1+eps)
-       shorts: side=='buy'  → hit als trigger_short <= tp*(1-eps)
-    """
     eps_up  = 1.0 + PAPER_EPS_PCT
     eps_dn  = 1.0 - PAPER_EPS_PCT
 
     for o in list(paper["open_orders"]):
         if o["status"] != "open" or o["type"] != "tp": continue
 
-        # ---- LONG sluiting (verkopen) ----
+        # ---- LONG sluiting ----
         if o["side"] == "sell":  # close LONG
             if trigger_long_price >= o["price"] * eps_up:
                 qty = o["qty"]; price = o["price"]
@@ -373,7 +372,7 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                     )
 
         # ---- SHORT sluiting (buy-to-cover) ----
-        elif o["side"] == "buy":  # close SHORT (buy-to-cover)
+        elif o["side"] == "buy":
             if trigger_short_price <= o["price"] * eps_dn:
                 qty = o["qty"]; price = o["price"]
                 parts, filled = _fifo_take("short_entries", qty)
@@ -527,8 +526,7 @@ def build_report_csv(include_hourly=True):
         hourly = {}
         for t in paper.get("closed_trades", []) or []:
             ts_exit = t.get("ts_exit")
-            if not ts_exit:
-                continue
+            if not ts_exit: continue
             try:
                 ts = pd.to_datetime(ts_exit, unit="ms", utc=True)
             except Exception:
@@ -606,13 +604,19 @@ def bot_thread():
             lower_break = don_low  - atr * BREAKOUT_ATR_MULT
             upper_break = don_high + atr * BREAKOUT_ATR_MULT
 
-            # ---- kies bias (alleen in trend mode)
+            # ---- bias (alleen in trend mode)
             bias = None
             if mode == "trend":
                 if BEARISH_BIAS and close < ema200:
                     bias = "bearish"
                 elif BULLISH_BIAS and close > ema200:
                     bias = "bullish"
+
+            # ==== Low-vol check: bepaal effectieve lagen ====
+            median_atr = float(d["atr"].rolling(200, min_periods=50).median().iloc[-1])
+            eff_layers = GRID_LAYERS
+            if atr < median_atr * VOL_MIN_MULT:
+                eff_layers = max(2, int(round(GRID_LAYERS * LOWVOL_LAYER_FACTOR)))
 
             need_rebuild = (last_atr is None or last_mode is None or last_center is None or not grid_live)
             if not need_rebuild:
@@ -624,7 +628,7 @@ def bot_thread():
                     need_rebuild = True
 
             if need_rebuild:
-                last_spacing, long_buys, short_sells, center_adj = build_grids(center, atr, mode, bias=bias)
+                last_spacing, long_buys, short_sells, center_adj = build_grids(center, atr, mode, eff_layers, bias=bias)
                 center = center_adj
                 grid_live = True; last_atr, last_mode, last_center = atr, mode, center
                 save_state({
@@ -632,22 +636,23 @@ def bot_thread():
                     "last_spacing": last_spacing, "updated_at": now_utc().isoformat(),
                     "last_levels": {"long_buys": long_buys, "short_sells": short_sells}
                 })
-                msg = (
-                    f"🔁 Rebuild grid — Mode <b>{mode}</b> | ADX≈{adx:.1f} | ATR≈{atr:.6f}\n"
-                    f"Center≈{center:.6f} | Spacing≈{last_spacing:.6f}\nHTF: [{don_low:.6f} .. {don_high:.6f}]"
-                )
-                if bias == "bearish":
-                    msg += "\n🧭 Bias: <b>bearish</b> (meer shorts + center↓)"
-                elif bias == "bullish":
-                    msg += "\n🧭 Bias: <b>bullish</b> (meer longs + center↑)"
                 if NOTIFY_REBUILD:
+                    msg = (
+                        f"🔁 Rebuild grid — Mode <b>{mode}</b> | ADX≈{adx:.1f} | ATR≈{atr:.6f}\n"
+                        f"Center≈{center:.6f} | Spacing≈{last_spacing:.6f} | Layers={eff_layers}\n"
+                        f"HTF: [{don_low:.6f} .. {don_high:.6f}]"
+                    )
+                    if bias == "bearish":
+                        msg += "\n🧭 Bias: <b>bearish</b> (meer shorts + center↓)"
+                    elif bias == "bullish":
+                        msg += "\n🧭 Bias: <b>bullish</b> (meer longs + center↑)"
                     send_telegram(msg)
                 if REPORT_TG_ON_REBUILD:
                     send_report_to_telegram()
 
             # === PAPER SIM (long + short) ===
             if paper["enabled"]:
-                spacing, long_buys, short_sells, center_adj = build_grids(center, atr, mode, bias=bias)
+                spacing, long_buys, short_sells, center_adj = build_grids(center, atr, mode, eff_layers, bias=bias)
 
                 if ENABLE_LONG:
                     for px in long_buys:
@@ -693,7 +698,7 @@ def bot_thread():
                 except Exception:
                     pass
 
-            logging.info(f"Tick | close={close:.6f} ADX={adx:.1f} ATR={atr:.6f} mode={mode} bias={bias}")
+            logging.info(f"Tick | close={close:.6f} ADX={adx:.1f} ATR={atr:.6f} mode={mode} bias={bias} layers={eff_layers}")
 
         except Exception as e:
             logging.exception(f"Loop error: {e}")
