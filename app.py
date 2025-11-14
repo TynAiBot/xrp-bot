@@ -111,6 +111,89 @@ DAILY_REPORT_HHMM = os.getenv("DAILY_REPORT_HHMM", "23:59")
 USD_TO_EUR = float(os.getenv("USD_TO_EUR", "0.86"))
 PORT = int(os.getenv("PORT", "10000"))
 
+# ==== Order pacing / exchange safety ====
+API_THROTTLE_MS = int(os.getenv("API_THROTTLE_MS", "300"))
+MAX_NEW_ORDERS_PER_TICK = int(os.getenv("MAX_NEW_ORDERS_PER_TICK", "6"))
+MAX_TP_PLACEMENTS_PER_TICK = int(os.getenv("MAX_TP_PLACEMENTS_PER_TICK", "8"))
+CANCEL_BATCH_SIZE = int(os.getenv("CANCEL_BATCH_SIZE", "10"))
+MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "6"))
+
+def _sleep_throttle():
+    time.sleep(max(API_THROTTLE_MS, 0) / 1000.0)
+
+def _notional_ok(price, qty):
+    # vermijd orders onder min notional (~MEXC-eis)
+    return (price * qty) >= (MIN_NOTIONAL_USDT - 1e-9)
+
+def place_ladder_spread(ex, side_levels, base_usdt, max_per_tick, spacing, center_adj, now_ms):
+    """
+    Doseer entries en TP's.
+    side_levels: lijst met tuples (price, 'long'|'short') die al 'raak' zijn op basis van je close/hi/lo checks.
+    In PAPER: gebruikt paper_place_buy/short + paper_place_tp_*
+    In LIVE (DRY_RUN=0): plaatst echte limit orders; TP live is optioneel (nu uit).
+    """
+    placed = 0
+    for px, side in side_levels:
+        if placed >= max_per_tick:
+            break
+        qty = round(base_usdt / max(px, 1e-12), 6)
+        if not _notional_ok(px, qty):
+            continue
+        try:
+            if DRY_RUN:
+                # PAPER — doe exact wat je al had: entry + TP
+                if side == "long":
+                    q = paper_place_buy(px, now_ms)
+                    if q:
+                        paper_place_tp_long(q, px, spacing, center_adj)
+                else:
+                    q = paper_place_short(px, now_ms)
+                    if q:
+                        paper_place_tp_short(q, px, spacing, center_adj)
+            else:
+                # LIVE — echte entry; TP live plaatsen kun je later aanzetten
+                order_side = "buy" if side == "long" else "sell"
+                params = {}
+                ex.create_order(SYMBOL, "limit", order_side, qty, px, params=params)
+                # TIP: live TP plaatsen? gebruik place_tp_batch(...) of interne TP-monitor
+            placed += 1
+            _sleep_throttle()
+        except ccxt.NetworkError as e:
+            logging.warning(f"Netwerkprobleem (entry): {e} – retry volgende tick")
+            break
+        except ccxt.ExchangeError as e:
+            logging.warning(f"Exchange error (entry): {e} – skip")
+            _sleep_throttle()
+            continue
+    return placed
+
+def place_tp_batch(ex, tp_orders, max_per_tick):
+    """
+    (Voor LIVE later) Doseer TP-limitorders via de exchange.
+    tp_orders: [{price, qty, side: 'sell'|'buy'}]
+    """
+    placed = 0
+    for o in tp_orders:
+        if placed >= max_per_tick:
+            break
+        px, qty, side = o["price"], o["qty"], o["side"]
+        if not _notional_ok(px, qty):
+            continue
+        try:
+            if DRY_RUN:
+                # In PAPER worden TP's al intern gemanaged; niets te doen
+                pass
+            else:
+                params = {}
+                ex.create_order(SYMBOL, "limit", side, qty, px, params=params)
+            placed += 1
+            _sleep_throttle()
+        except Exception as e:
+            logging.warning(f"TP plaatsing faalde: {e}")
+            _sleep_throttle()
+            continue
+    return placed
+
 # ===== Globals =====
 app = Flask(__name__)
 _stop = Event()
@@ -650,23 +733,38 @@ def bot_thread():
                 if REPORT_TG_ON_REBUILD:
                     send_report_to_telegram()
 
-            # === PAPER SIM (long + short) ===
+                        # === ENTRIES & TP (PAPER) — paced/dosed ===
             if paper["enabled"]:
                 spacing, long_buys, short_sells, center_adj = build_grids(center, atr, mode, eff_layers, bias=bias)
 
+                long_levels = []
+                short_levels = []
+                now_ms = int(time.time() * 1000)
+
                 if ENABLE_LONG:
+                    # neem alleen levels die "raak" zijn
                     for px in long_buys:
-                        if close <= px and paper["usdt_trading"] >= BASE_ORDER_USDT:
-                            qty = paper_place_buy(px, int(time.time()*1000))
-                            if qty:
-                                paper_place_tp_long(qty, px, spacing, center_adj)
+                        if close <= px:
+                            long_levels.append((px, "long"))
 
                 if ENABLE_SHORT:
                     for px in short_sells:
-                        if close >= px and paper["usdt_trading"] >= BASE_ORDER_USDT:
-                            qty = paper_place_short(px, int(time.time()*1000))
-                            if qty:
-                                paper_place_tp_short(qty, px, spacing, center_adj)
+                        if close >= px:
+                            short_levels.append((px, "short"))
+
+                # Gedoseerd entries plaatsen; in PAPER zet dit óók meteen de bijbehorende TP per entry
+                _ = place_ladder_spread(
+                    ex, long_levels, BASE_ORDER_USDT, MAX_NEW_ORDERS_PER_TICK, spacing, center_adj, now_ms
+                )
+                _ = place_ladder_spread(
+                    ex, short_levels, BASE_ORDER_USDT, MAX_NEW_ORDERS_PER_TICK, spacing, center_adj, now_ms
+                )
+
+                # TP-executie (PAPER behandelt TP's intern)
+                trigger_long = hi if TP_TRIGGER_MODE == "wick" else close
+                trigger_short = lo if TP_TRIGGER_MODE == "wick" else close
+                paper_exec_tps(trigger_long, trigger_short, now_ms)
+
 
                 trigger_long  = hi if TP_TRIGGER_MODE == "wick" else close
                 trigger_short = lo if TP_TRIGGER_MODE == "wick" else close
