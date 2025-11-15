@@ -768,7 +768,7 @@ def bot_thread():
                 now_ms = int(time.time() * 1000)
 
                 if ENABLE_LONG:
-                    # neem alleen levels die "raak" zijn
+                    # neem alleen levels die "raak" zijnn
                     for px in long_buys:
                         if close <= px:
                             long_levels.append((px, "long"))
@@ -1009,3 +1009,4 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=PORT)
     finally:
         _stop.set(); t.join(timeout=5)
+
