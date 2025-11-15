@@ -430,15 +430,26 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                 paper["usdt_trading"] += (proceeds - fee_sell)
                 paper["xrp"] -= filled
                 paper["realized_pnl_usdt"] += pnl
+
+                # registreer closure met side (LONG)
                 paper["closed_trades"].append({
-                    "entry": round(avg_entry,6), "exit": round(price,6), "qty": round(filled,6),
-                    "pnl_usdt": round(pnl,6), "ts_entry": parts[0]["ts"] if parts else None, "ts_exit": now_ts
+                    "entry": round(avg_entry, 6),
+                    "exit":  round(price,     6),
+                    "qty":   round(filled,    6),
+                    "pnl_usdt": round(pnl,    6),
+                    "ts_entry": parts[0]["ts"] if parts else None,
+                    "ts_exit":  now_ts,
+                    "side": "long"
                 })
-                o["status"] = "filled"
 
+                # duidelijke TG-melding
                 if NOTIFY_TP_SL:
-                    send_telegram(f"🧪 PAPER SELL {filled:g} @ {price:.6f} (avg entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT")
+                    send_telegram(
+                        f"🧪 CLOSE LONG {filled:g} @ {price:.6f} "
+                        f"(entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT"
+                    )
 
+                # sparen (buiten TG-if)
                 if SPAREN_ENABLED and pnl > SPAREN_MIN_PNL_USDT and SPAREN_SPLIT_PCT > 0:
                     to_save = min(pnl * (SPAREN_SPLIT_PCT/100.0), paper["usdt_trading"])
                     paper["usdt_trading"] -= to_save
@@ -446,6 +457,7 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                     if NOTIFY_SPAREN:
                         send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
 
+                # overzicht (buiten TG-if)
                 if NOTIFY_SELL_OVERVIEW:
                     send_telegram(
                         f"📊 PAPER: Realized {paper['realized_pnl_usdt']:.4f} USDT | "
@@ -453,6 +465,7 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                         f"Open LONG {paper['xrp']:.4f} | "
                         f"Open SHORT {sum(e['qty'] for e in paper['short_entries']):.4f}"
                     )
+
 
         # ---- SHORT sluiting (buy-to-cover) ----
         elif o["side"] == "buy":
@@ -472,15 +485,26 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
 
                 paper["usdt_trading"]      += pnl
                 paper["realized_pnl_usdt"] += pnl
+
+                # registreer closure met side (SHORT)
                 paper["closed_trades"].append({
-                    "entry": round(avg_entry,6), "exit": round(price,6), "qty": round(filled,6),
-                    "pnl_usdt": round(pnl,6), "ts_entry": parts[0]["ts"] if parts else None, "ts_exit": now_ts
+                    "entry": round(avg_entry, 6),
+                    "exit":  round(price,     6),
+                    "qty":   round(filled,    6),
+                    "pnl_usdt": round(pnl,    6),
+                    "ts_entry": parts[0]["ts"] if parts else None,
+                    "ts_exit":  now_ts,
+                    "side": "short"
                 })
-                o["status"] = "filled"
 
+                # duidelijke TG-melding
                 if NOTIFY_TP_SL:
-                    send_telegram(f"🧪 PAPER BUY {filled:g} @ {price:.6f} (short cover; avg entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT")
+                    send_telegram(
+                        f"🧪 COVER SHORT {filled:g} @ {price:.6f} "
+                        f"(entry {avg_entry:.6f}) | PnL {pnl:+.4f} USDT"
+                    )
 
+                # sparen (buiten TG-if)
                 if SPAREN_ENABLED and pnl > SPAREN_MIN_PNL_USDT and SPAREN_SPLIT_PCT > 0:
                     to_save = min(pnl * (SPAREN_SPLIT_PCT/100.0), paper["usdt_trading"])
                     paper["usdt_trading"] -= to_save
@@ -488,6 +512,7 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                     if NOTIFY_SPAREN:
                         send_telegram(f"💰 PAPER sparen +{to_save:.4f} USDT ({SPAREN_SPLIT_PCT:.0f}% van winst)")
 
+                # overzicht (buiten TG-if)
                 if NOTIFY_SELL_OVERVIEW:
                     send_telegram(
                         f"📊 PAPER: Realized {paper['realized_pnl_usdt']:.4f} USDT | "
@@ -495,6 +520,7 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
                         f"Open LONG {paper['xrp']:.4f} | "
                         f"Open SHORT {sum(e['qty'] for e in paper['short_entries']):.4f}"
                     )
+
 
     paper["open_orders"] = [o for o in paper["open_orders"] if o["status"] == "open"]
 
