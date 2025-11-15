@@ -874,6 +874,109 @@ def report_telegram_ep():
     send_report_to_telegram()
     return jsonify({"ok": True, "msg": "Report to Telegram verzonden."})
 
+@app.route("/report/table")
+def report_table():
+    # haal gesloten trades uit dezelfde bron die je voor /paper/export gebruikt
+    # verwacht structuur met keys: entry, exit, qty, pnl_usdt, ts_entry, ts_exit
+    rows = []
+    try:
+        # Als je al een paper-state hebt zoals paper["closed"], gebruik die:
+        global paper
+        rows = paper.get("closed", []) if isinstance(paper, dict) else []
+
+        # fallback: als je elders een lijst houdt (pas zo nodig aan jouw variabelenaam)
+        if not rows and "paper_closed" in globals():
+            rows = paper_closed  # type: ignore
+
+    except Exception:
+        rows = []
+
+    # niets te tonen?
+    if not rows:
+        return (
+            "<h3>Geen gesloten trades gevonden</h3>"
+            "<p>Wacht op een paar 🧪 PAPER SELL regels of run /paper/export, "
+            "en refresh dan deze pagina.</p>",
+            200,
+            {"Content-Type": "text/html; charset=utf-8"},
+        )
+
+    # maak nette koppen & bereken KPI's
+    import math
+    def to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return math.nan
+
+    # sorteren op ts_exit indien aanwezig
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (str(r.get("ts_exit", "")), str(r.get("ts_entry", "")))
+    )
+
+    # cumulatieve PnL, winrate, enz.
+    realized = 0.0
+    wins = 0
+    total = 0
+    table_rows_html = []
+    for r in rows_sorted:
+        entry = to_float(r.get("entry"))
+        exitp = to_float(r.get("exit"))
+        qty = to_float(r.get("qty"))
+        pnl = to_float(r.get("pnl_usdt"))
+        ts_e = r.get("ts_entry", "")
+        ts_x = r.get("ts_exit", "")
+
+        realized += (0.0 if math.isnan(pnl) else pnl)
+        total += 1
+        if not math.isnan(pnl) and pnl > 0:
+            wins += 1
+
+        # cumulatieve kolom tonen
+        cum = realized
+
+        table_rows_html.append(
+            f"<tr>"
+            f"<td>{ts_e}</td>"
+            f"<td>{ts_x}</td>"
+            f"<td>{qty:.6f}</td>"
+            f"<td>{entry:.6f}</td>"
+            f"<td>{exitp:.6f}</td>"
+            f"<td>{pnl:.6f}</td>"
+            f"<td>{cum:.6f}</td>"
+            f"</tr>"
+        )
+
+    winrate = (wins / total * 100.0) if total else 0.0
+
+    kpi_html = (
+        "<h3>KPI’s — huidige run</h3>"
+        "<table border='1' cellpadding='6' cellspacing='0'>"
+        "<tr><th>Closed trades</th><th>Realized PnL (USDT)</th><th>Win rate</th></tr>"
+        f"<tr><td>{total}</td><td>{realized:.6f}</td><td>{winrate:.2f}%</td></tr>"
+        "</table><br/>"
+    )
+
+    html = (
+        "<!DOCTYPE html><meta charset='utf-8'/>"
+        "<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif} "
+        "table{border-collapse:collapse;font-size:14px} "
+        "th,td{padding:6px 10px} th{background:#f3f4f6}</style>"
+        + kpi_html +
+        "<h3>Gesloten trades</h3>"
+        "<table border='1' cellpadding='6' cellspacing='0'>"
+        "<tr>"
+        "<th>ts_entry</th><th>ts_exit</th>"
+        "<th>qty</th><th>entry</th><th>exit</th>"
+        "<th>pnl_usdt</th><th>cum_pnl_usdt</th>"
+        "</tr>"
+        + "".join(table_rows_html) +
+        "</table>"
+    )
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 if __name__ == "__main__":
     t = Thread(target=bot_thread, daemon=True); t.start()
     try:
