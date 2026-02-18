@@ -60,8 +60,6 @@ REDUCE_ONLY_TP = int(os.getenv("REDUCE_ONLY_TP", "0"))
 # Runtime
 POLL_SEC            = int(os.getenv("POLL_SEC", "15"))
 REBUILD_ATR_DELTA   = float(os.getenv("REBUILD_ATR_DELTA", "0.2"))
-RECENTER_ATR_MULT  = float(os.getenv("RECENTER_ATR_MULT", "1.5"))
-MAX_CENTER_AGE_SEC = int(os.getenv("MAX_CENTER_AGE_SEC", "900"))
 BREAKOUT_ATR_MULT   = float(os.getenv("BREAKOUT_ATR_MULT", "1.0"))
 DRY_RUN             = int(os.getenv("DRY_RUN", "1"))
 
@@ -147,7 +145,7 @@ def place_ladder_spread(ex, side_levels, base_usdt, max_per_tick, spacing, cente
                 if side == "long":
                     q = paper_place_buy(px, now_ms)
                     if q:
-                        paper_place_tp_long(q, px, spacing, center_adj, ref_ts=now_ms)
+                        paper_place_tp_long(q, px, spacing, center_adj)
                 else:
                     q = paper_place_short(px, now_ms)
                     if q:
@@ -249,11 +247,27 @@ def ccxt_client():
     if EXCHANGE != "mexc":
         raise RuntimeError("Alleen 'mexc' wordt ondersteund in deze build.")
     opts = {
-        "apiKey": API_KEY, "secret": API_SECRET,
-        "enableRateLimit": True, "timeout": CCXT_TIMEOUT_MS,
-        "options": {"defaultType": "swap" if USE_PERP else "spot", "recvWindow": MEXC_RECVWINDOW_MS}
+        "enableRateLimit": True,
+        "timeout": CCXT_TIMEOUT_MS,
+        "options": {
+            "defaultType": "swap" if USE_PERP else "spot",
+            "recvWindow": MEXC_RECVWINDOW_MS,
+        },
     }
-    ex = ccxt.mexc(opts); ex.load_markets(); return ex
+    # Alleen auth meegeven als beide waarden gezet zijn.
+    # (Met lege key/secret gaat CCXT alsnog signed private calls doen en krijg je 'Api key info invalid'.)
+    if API_KEY and API_SECRET:
+        opts["apiKey"] = API_KEY
+        opts["secret"] = API_SECRET
+
+    ex = ccxt.mexc(opts)
+
+    # Belangrijk: voorkom dat load_markets() via fetch_currencies() een private endpoint aanroept:
+    # /api/v3/capital/config/getall  -> kan falen bij key/permissions/IP-whitelist en is niet nodig voor trading.
+    ex.options["fetchCurrencies"] = False
+
+    ex.load_markets()
+    return ex
 
 def set_deriv_modes(ex):
     if (not USE_PERP) or (not DERIV_SETUP):
@@ -371,10 +385,10 @@ def paper_place_buy(price, now_ts):
     if NOTIFY_FILLS: send_telegram(f"🧪 PAPER BUY {qty:g} @ {price:.6f} (fee {fee_buy:.4f} USDT)")
     return qty
 
-def paper_place_tp_long(qty, entry_price, spacing, center, ref_ts=None):
+def paper_place_tp_long(qty, entry_price, spacing, center):
     tp = compute_tp_price(TP_MODE, entry_price, spacing, center, "long")
     oid = f"PTP-L-{int(time.time()*1000)}-{tp}"
-    paper["open_orders"].append({"id": oid, "type": "tp", "side": "sell", "price": tp, "qty": qty, "status": "open", "ref_ts": ref_ts})
+    paper["open_orders"].append({"id": oid, "type": "tp", "side": "sell", "price": tp, "qty": qty, "status": "open"})
     if NOTIFY_TP_PLACED:
         send_telegram(f"🧪 PAPER TP geplaatst SELL @ {tp:.6f}")
 
@@ -391,7 +405,7 @@ def paper_place_short(price, now_ts):
 def paper_place_tp_short(qty, entry_price, spacing, center):
     tp = compute_tp_price(TP_MODE, entry_price, spacing, center, "short")
     oid = f"PTP-S-{int(time.time()*1000)}-{tp}"
-    paper["open_orders"].append({"id": oid, "type": "tp", "side": "buy", "price": tp, "qty": qty, "status": "open", "ref_ts": ref_ts})
+    paper["open_orders"].append({"id": oid, "type": "tp", "side": "buy", "price": tp, "qty": qty, "status": "open"})
     if NOTIFY_TP_PLACED:
         send_telegram(f"🧪 PAPER TP geplaatst BUY @ {tp:.6f} (short)")
 
@@ -406,27 +420,6 @@ def _fifo_take(lots_key, qty_need):
         if e["qty"] <= 1e-9: paper[lots_key].pop(0)
     return taken, qty_need - qty_left
 
-
-def _take_specific_ts(lots_key, ref_ts, qty_need):
-    """Neem (deels) uit een specifieke lot (op ts) zodat TP niet per ongeluk een ander (oud) lot sluit."""
-    if ref_ts is None:
-        return [], 0.0
-    qty_left = qty_need
-    taken = []
-    for e in list(paper[lots_key]):
-        if e.get("ts") != ref_ts:
-            continue
-        q = min(e["qty"], qty_left)
-        if q <= 0:
-            break
-        part_fee = e["fee_usdt"] * (q / e["qty"])
-        taken.append({"qty": q, "entry": e["entry"], "fee_usdt": part_fee, "ts": e["ts"]})
-        e["qty"] -= q
-        qty_left -= q
-        if e["qty"] <= 1e-9:
-            paper[lots_key].remove(e)
-        break
-    return taken, qty_need - qty_left
 def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
     eps_up  = 1.0 + PAPER_EPS_PCT
     eps_dn  = 1.0 - PAPER_EPS_PCT
@@ -438,9 +431,7 @@ def paper_exec_tps(trigger_long_price, trigger_short_price, now_ts):
         if o["side"] == "sell":  # close LONG
             if trigger_long_price >= o["price"] * eps_up:
                 qty = o["qty"]; price = o["price"]
-                parts, filled = _take_specific_ts("open_entries", o.get("ref_ts"), qty)
-                if filled <= 0:
-                    parts, filled = _fifo_take("open_entries", qty)
+                parts, filled = _fifo_take("open_entries", qty)
                 if filled <= 0:
                     o["status"] = "filled"
                     continue
@@ -711,7 +702,6 @@ def bot_thread():
     last_center= state.get("last_center")
     grid_live  = state.get("grid_live", False)
     last_spacing = state.get("last_spacing")
-    last_rebuild_ts = float(state.get("last_rebuild_ts") or time.time())
 
     if paper["enabled"]:
         paper_reset()
@@ -757,12 +747,6 @@ def bot_thread():
             if not need_rebuild:
                 if abs(atr - last_atr) / max(1e-8, last_atr) > REBUILD_ATR_DELTA: need_rebuild = True
                 if mode != last_mode: need_rebuild = True
-                # Recenter: als prijs te ver wegdrijft van het huidige grid-center
-                if abs(close - last_center) > (RECENTER_ATR_MULT * atr):
-                    need_rebuild = True
-                # Time refresh: voorkom "vastplakken" bij langzaam verschuivende markt
-                if (time.time() - last_rebuild_ts) > MAX_CENTER_AGE_SEC:
-                    need_rebuild = True
                 if close < lower_break or close > upper_break:
                     if NOTIFY_REBUILD:
                         send_telegram(f"⚠️ Breakout: close {close:.6f} buiten [{lower_break:.6f}, {upper_break:.6f}] — rebuild")
@@ -771,10 +755,10 @@ def bot_thread():
             if need_rebuild:
                 last_spacing, long_buys, short_sells, center_adj = build_grids(center, atr, mode, eff_layers, bias=bias)
                 center = center_adj
-                grid_live = True; last_atr, last_mode, last_center = atr, mode, center; last_rebuild_ts = time.time()
+                grid_live = True; last_atr, last_mode, last_center = atr, mode, center
                 save_state({
                     "last_atr": last_atr, "last_mode": last_mode, "last_center": last_center, "grid_live": grid_live,
-                    "last_spacing": last_spacing, "updated_at": now_utc().isoformat(), "last_rebuild_ts": time.time(),
+                    "last_spacing": last_spacing, "updated_at": now_utc().isoformat(),
                     "last_levels": {"long_buys": long_buys, "short_sells": short_sells}
                 })
                 if NOTIFY_REBUILD:
