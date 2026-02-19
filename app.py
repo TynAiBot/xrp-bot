@@ -257,16 +257,31 @@ def ccxt_client():
     # Alleen auth meegeven als beide waarden gezet zijn.
     # (Met lege key/secret gaat CCXT alsnog signed private calls doen en krijg je 'Api key info invalid'.)
     if API_KEY and API_SECRET:
-        opts["apiKey"] = API_KEY
-        opts["secret"] = API_SECRET
+        opts["apiKey"] = API_KEY.strip()
+        opts["secret"] = API_SECRET.strip()
 
     ex = ccxt.mexc(opts)
 
-    # Belangrijk: voorkom dat load_markets() via fetch_currencies() een private endpoint aanroept:
-    # /api/v3/capital/config/getall  -> kan falen bij key/permissions/IP-whitelist en is niet nodig voor trading.
-    ex.options["fetchCurrencies"] = False
+    # --- Render/MEXC hardening ---
+    # CCXT (mexc) kan bij load_markets() fetch_currencies() aanroepen, wat een signed private call doet:
+    #   /api/v3/capital/config/getall
+    # Dat is niet nodig voor trading en faalt vaak op Render door key/permissions/IP-whitelist.
+    # Forceer daarom dat CCXT géén currencies ophaalt.
+    try:
+        ex.options["fetchCurrencies"] = False
+    except Exception:
+        pass
+    try:
+        ex.has["fetchCurrencies"] = False
+    except Exception:
+        pass
 
-    ex.load_markets()
+    # Probeer markets te laden; als MEXC toch faalt, ga door met een waarschuwing zodat paper/simulatie blijft draaien.
+    try:
+        ex.load_markets()
+    except Exception as e:
+        logging.warning(f"load_markets() faalde (wordt overgeslagen): {e}")
+
     return ex
 
 def set_deriv_modes(ex):
